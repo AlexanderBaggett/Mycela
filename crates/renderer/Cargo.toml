@@ -1,0 +1,18 @@
+[package]
+name = "mycela-renderer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+mycela-engine = { path = "../engine" }
+mycela-system-memory = { path = "../system-memory" }
+wgpu = "=29.0.4"
+half = "=2.7.1"
+
+[dev-dependencies]
+pollster = "=0.4.0"

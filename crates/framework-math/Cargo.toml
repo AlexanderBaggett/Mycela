@@ -1,0 +1,16 @@
+[package]
+name = "mycela-framework-math"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints.rust]
+unsafe_code = "deny"
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[target.'cfg(not(any(target_arch = "x86", target_arch = "x86_64")))'.dependencies]
+libm = "=0.2.16"

@@ -1,0 +1,15 @@
+[workspace]
+members = ["crates/engine", "crates/app", "crates/system-memory", "crates/renderer", "crates/jpeg", "crates/framework-math"]
+default-members = ["crates/engine"]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

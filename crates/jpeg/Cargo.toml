@@ -1,0 +1,15 @@
+[package]
+name = "mycela-jpeg"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[build-dependencies]
+cc = "=1.8.0"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
