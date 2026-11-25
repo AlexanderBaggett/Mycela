@@ -1,5 +1,4 @@
 //! Dialog drafts for Color and Gradient Lab controls.
-use super::numeric_adjusters::number_field;
 use super::style::paint_gradient::{Action, Draft};
 use super::*;
 use mycela_engine::{LabColorAdjuster, LabColorValue, SharedGradient};
@@ -98,12 +97,16 @@ impl Render for ColorAdjusterForm {
         let fields = match &self.fields {
             Fields::Color(fields) => Form::new()
                 .columns(3)
-                .children(
-                    fields
-                        .iter()
-                        .zip(CHANNELS)
-                        .map(|(input, (id, label))| number_field(input, id, label)),
-                )
+                .children(fields.iter().zip(CHANNELS).map(|(input, (id, label))| {
+                    Field::new()
+                        .label(label)
+                        .child(super::numeric_field::NumericField::new(
+                            input,
+                            id,
+                            label,
+                            super::numeric_field::NumericRange::new(0.0, 1.0, 0.001),
+                        ))
+                }))
                 .into_any_element(),
             Fields::Gradient { draft, .. } => {
                 let owner = cx.weak_entity();

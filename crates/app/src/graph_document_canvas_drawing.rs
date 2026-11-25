@@ -1125,12 +1125,9 @@ impl GraphDocumentView {
             .iter()
             .filter(|draft| draft.canvas_shape_field().is_some())
             .map(|draft| {
-                Field::new().label(draft.label.clone()).child(
-                    Input::new(&draft.input)
-                        .id(draft.id.clone())
-                        .aria_label(draft.label.clone())
-                        .disabled(busy),
-                )
+                Field::new()
+                    .label(draft.label.clone())
+                    .child(draft.control(busy))
             });
         let owner = cx.weak_entity();
         let revision = self.revision;

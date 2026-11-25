@@ -3,12 +3,13 @@ use super::super::inspector::{AnimationOwner, AnimationParameter};
 use super::environment::EnvironmentPanel;
 use super::{GraphDocumentView, adjuster_name::AdjusterNameKind, guard, model};
 use crate::ForegroundError;
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use gpui_kit::base::{Disableable, StyledExt, TestSupportExt};
 use gpui_kit::component::{
     ActiveTheme, Sizable,
     button::{Button, ButtonVariants},
     form::Field,
-    input::{Input, InputState},
+    input::InputState,
     menu::{DropdownMenu, PopupMenuItem},
 };
 use gpui_kit::{App, AppContext, Context, Entity, IntoElement, Window, div, prelude::*};
@@ -77,7 +78,7 @@ impl GradientEditor {
         Self::build(GradientOwner::Draft, gradient, window, cx)
     }
 
-    pub(super) fn width(&self) -> i32 {
+    pub(crate) fn width(&self) -> i32 {
         self.gradient.width()
     }
 
@@ -689,10 +690,17 @@ impl GraphDocumentView {
             .children(adjuster)
             .child(
                 Field::new().label("New stop position").child(
-                    Input::new(&editor.position)
-                        .id(editor.control_id("new-position"))
-                        .aria_label("New gradient stop position")
-                        .disabled(disabled),
+                    NumericField::new(
+                        &editor.position,
+                        editor.control_id("new-position"),
+                        "New gradient stop position",
+                        NumericRange::new(
+                            0.0,
+                            f64::from(editor.width().saturating_sub(1).max(0)),
+                            1.0,
+                        ),
+                    )
+                    .disabled(disabled),
                 ),
             )
             .child(

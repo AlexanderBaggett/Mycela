@@ -4,6 +4,7 @@ use super::super::navigation::editable_contents;
 use super::node_library::LibraryNodeDrag;
 use super::*;
 use gpui_kit::base::ElementExt;
+use gpui_kit::component::menu::ContextMenuExt;
 use gpui_kit::component::slider::{SliderEvent, SliderState};
 use gpui_kit::{
     ElementId, MouseButton, PathBuilder, Pixels, Point, ScrollHandle, Subscription, canvas, point,
@@ -35,6 +36,92 @@ const INPUT_GAP: f32 = 1.;
 const INPUT_WIRE_SPACE: f32 = 2.5;
 const INPUT_ROW_HEIGHT: f32 = CARD_WIDTH + INPUT_WIRE_SPACE;
 const OUTPUT_TERMINAL_SPACE: f32 = 4.5;
+
+struct GraphClipboard(Node);
+impl gpui_kit::Global for GraphClipboard {}
+
+fn copy_node_tree(source: &Node) -> Result<Node, PointwiseError<ForegroundError>> {
+    use mycela_engine::PointwiseKind;
+
+    let snapshot = source.source_clone()?;
+    let source_slot = source.parent().and_then(|parent| {
+        parent
+            .slots()
+            .into_iter()
+            .chain(parent.contents())
+            .find(|slot| slot.node().is_some_and(|node| node.same_reference(source)))
+    });
+    let Some(scope) = source_slot
+        .map(|slot| slot.reference_scope())
+        .transpose()?
+        .flatten()
+    else {
+        return Ok(snapshot);
+    };
+    // References in nested Group contents use their own inputs. References
+    // reached through ordinary slots still use the enclosing Group.
+    let mut pending = vec![snapshot.clone()];
+    while let Some(node) = pending.pop() {
+        if node.kind() == Some(PointwiseKind::Reference) {
+            let group = PointwiseFilter::new(PointwiseKind::Group)?;
+            let inputs = scope.reference_inputs()?;
+            group.parameter(0)?.set_number(inputs.len() as f64)?;
+            for (source, target) in inputs.into_iter().zip(group.node().slots()) {
+                if let Some(input) = source.node().filter(|node| !node.is_default_input()) {
+                    target.set_node_quiet(Some(&copy_node_tree(&input)?))?;
+                }
+            }
+            group.node().content(0)?.set_node_quiet(Some(&snapshot))?;
+            return Ok(group.node());
+        }
+        pending.extend(node.slots().into_iter().filter_map(|slot| slot.node()));
+    }
+    Ok(snapshot)
+}
+
+#[derive(Clone)]
+struct NodeCommandTarget {
+    view: gpui_kit::WeakEntity<GraphDocumentView>,
+    key: String,
+    revision: u64,
+    serial: u64,
+}
+
+impl NodeCommandTarget {
+    fn run(
+        &self,
+        window: &mut Window,
+        cx: &mut App,
+        action: impl FnOnce(&mut GraphDocumentView, &str, &mut Window, &mut Context<GraphDocumentView>),
+    ) {
+        let _ = self.view.update(cx, |view, cx| {
+            if view.canvas_current(self.revision, self.serial, cx)
+                && view
+                    .navigation
+                    .target(&self.key)
+                    .is_some_and(|target| view.canvas_target_current(&target))
+            {
+                if view.selection.as_deref() != Some(self.key.as_str()) {
+                    view.canvas_select(self.key.clone(), self.revision, self.serial, window, cx);
+                }
+                if view.selection.as_deref() == Some(self.key.as_str()) {
+                    action(view, &self.key, window, cx);
+                }
+            }
+        });
+    }
+
+    fn item(
+        &self,
+        label: &'static str,
+        action: fn(&mut GraphDocumentView, &mut Window, &mut Context<GraphDocumentView>),
+    ) -> PopupMenuItem {
+        let target = self.clone();
+        PopupMenuItem::new(label).on_click(move |_, window, cx| {
+            target.run(window, cx, |view, _, window, cx| action(view, window, cx));
+        })
+    }
+}
 
 gpui_kit::actions!(
     graph_canvas,
@@ -382,17 +469,6 @@ impl CanvasState {
             .iter()
             .map(|(node, _, _, _)| self.collapsed.contains(&node.occurrence_id()))
             .collect();
-        let mut positions = vec![[0.; 2]; current.len()];
-        let mut next_x = CANVAS_MARGIN;
-        for (root, parent) in receiver.iter().enumerate() {
-            if parent.is_some() {
-                continue;
-            }
-            let span = measure_columns(root, &mut inputs);
-            let body = [next_x + (span - CARD_WIDTH) / 2., 0.];
-            place_cards(root, body, &inputs, &collapsed, &mut positions);
-            next_x += span + CARD_GAP;
-        }
         let output_key = group
             .is_none()
             .then(|| {
@@ -401,21 +477,46 @@ impl CanvasState {
                 })
             })
             .flatten();
+        let mut positions = vec![[0.; 2]; current.len()];
+        let mut next_x = if group.is_none()
+            && !current
+                .iter()
+                .any(|(_, key, _, _)| output_key == Some(key.as_str()))
+        {
+            CANVAS_MARGIN + CARD_WIDTH + CARD_GAP
+        } else {
+            CANVAS_MARGIN
+        };
+        for (root, parent) in receiver.iter().enumerate() {
+            if parent.is_some() {
+                continue;
+            }
+            let span = measure_columns(root, &mut inputs);
+            let body = if output_key == Some(current[root].1.as_str()) {
+                [CANVAS_MARGIN, 0.]
+            } else {
+                [next_x + (span - CARD_WIDTH) / 2., 0.]
+            };
+            place_cards(root, body, &inputs, &collapsed, &mut positions);
+            next_x += span + CARD_GAP;
+        }
         let mut cards = Vec::new();
         for (index, ((node, key, _, hidden), inputs)) in current.into_iter().zip(inputs).enumerate()
         {
-            let (id, manual_offset) =
-                if let Some(old) = self.cards.iter().find(|old| old.node.same_reference(&node)) {
-                    let offset = if arrange || receiver[index].is_some() {
+            let (id, manual_offset) = if let Some(old) =
+                self.cards.iter().find(|old| old.node.same_reference(&node))
+            {
+                let offset =
+                    if arrange || receiver[index].is_some() || output_key == Some(key.as_str()) {
                         [0.; 2]
                     } else {
                         old.manual_offset
                     };
-                    (old.id, offset)
-                } else {
-                    self.next += 1;
-                    (self.next, [0.; 2])
-                };
+                (old.id, offset)
+            } else {
+                self.next += 1;
+                (self.next, [0.; 2])
+            };
             cards.push(Card {
                 id,
                 collapsed: collapsed[index],
@@ -443,7 +544,7 @@ impl CanvasState {
             || navigation.branch_positions.clone(),
             |group| group.group_content_positions(),
         );
-        self.branch_origin = place_branches(&mut cards, &branches, &positions, [CANVAS_MARGIN, 0.]);
+        self.branch_origin = place_branches(&mut cards, &branches, &positions, group.is_none());
         // Only currently reachable nodes sponsor a graph. Retired menus/jobs
         // keep their own explicit held owners until their normal retirement.
         self.cards = cards;
@@ -491,13 +592,20 @@ impl CanvasState {
     }
 
     fn viewport(&self, rem: Pixels) -> Viewport {
-        Viewport::new(
-            &GraphBounds::for_cards(&self.cards),
-            self.viewport_size,
-            rem,
-            self.zoom,
-        )
-        .with_padding(self.zoom_padding)
+        Viewport::new(&self.graph_bounds(), self.viewport_size, rem, self.zoom)
+            .with_padding(self.zoom_padding)
+    }
+
+    fn output_position(&self) -> Option<[f32; 2]> {
+        self.group().is_none().then_some(self.branch_origin)
+    }
+
+    fn graph_bounds(&self) -> GraphBounds {
+        let mut bounds = GraphBounds::for_cards(&self.cards);
+        if let Some(position) = self.output_position() {
+            bounds.include(position, CARD_WIDTH, CARD_WIDTH + OUTPUT_TERMINAL_SPACE);
+        }
+        bounds
     }
 
     fn socket_position(&self, key: &str) -> Option<[f32; 2]> {
@@ -522,7 +630,7 @@ impl CanvasState {
         if self.zoom == zoom || !self.has_viewport() {
             return false;
         }
-        let bounds = GraphBounds::for_cards(&self.cards);
+        let bounds = self.graph_bounds();
         let old = Viewport::new(&bounds, self.viewport_size, rem, self.zoom)
             .with_padding(self.zoom_padding);
         let cursor = cursor.unwrap_or_else(|| old.center());
@@ -554,7 +662,7 @@ impl CanvasState {
     }
 
     fn fit(&mut self, rem: Pixels) {
-        let bounds = GraphBounds::for_cards(&self.cards);
+        let bounds = self.graph_bounds();
         self.zoom = bounds.fit(self.viewport_size, rem);
         self.zoom_padding = Point::default();
         let viewport = Viewport::new(&bounds, self.viewport_size, rem, self.zoom);
@@ -608,12 +716,17 @@ fn place_branches(
     cards: &mut [Card],
     branches: &[&super::super::navigation::Row],
     positions: &[[f32; 2]],
-    default_origin: [f32; 2],
+    fixed_output: bool,
 ) -> [f32; 2] {
-    let origin = branches
-        .first()
-        .and_then(|row| cards.iter().find(|card| card.key == row.key))
-        .map_or(default_origin, |card| card.position);
+    let default_origin = [CANVAS_MARGIN, 0.];
+    let origin = if fixed_output {
+        default_origin
+    } else {
+        branches
+            .first()
+            .and_then(|row| cards.iter().find(|card| card.key == row.key))
+            .map_or(default_origin, |card| card.position)
+    };
     for (branch, position) in branches.iter().skip(1).zip(positions.iter().copied()) {
         // Newly created extra branches use zero until the user places them.
         if position == [0.; 2] || !position.into_iter().all(f32::is_finite) {
@@ -666,7 +779,7 @@ fn place_branches(
 #[derive(Clone)]
 struct WireDrag {
     revision: u64,
-    selection_serial: u64,
+    selection_serial: Cell<u64>,
     node: Node,
     share: bool,
 }
@@ -940,6 +1053,189 @@ fn reachable(roots: Vec<Node>, wanted: &Node) -> bool {
     false
 }
 impl GraphDocumentView {
+    pub(super) fn build_node_commands(
+        mut menu: PopupMenu,
+        owner: &gpui_kit::WeakEntity<Self>,
+        key: &str,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> PopupMenu {
+        let Some(entity) = owner.upgrade() else {
+            return menu;
+        };
+        let view = entity.read(cx);
+        let Some(target) = view.navigation.target(key) else {
+            return menu;
+        };
+        if view.is_busy() {
+            return menu;
+        }
+        let command = NodeCommandTarget {
+            view: owner.clone(),
+            key: key.to_owned(),
+            revision: view.revision,
+            serial: view.selection_serial,
+        };
+        let node = target.node();
+        let occupied = node.is_some();
+        let editable_node = node.as_ref().is_some_and(|node| !node.is_default_input());
+        let supports_contents = |kind| {
+            matches!(
+                kind,
+                Some(
+                    mycela_engine::PointwiseKind::Group
+                        | mycela_engine::PointwiseKind::WizardGroup
+                        | mycela_engine::PointwiseKind::MapVariable
+                )
+            )
+        };
+        let kind = node.as_ref().and_then(Node::kind);
+        let removable_contents = matches!(&target, Target::Slot(slot) if {
+            let parent = slot.parent();
+            supports_contents(parent.kind())
+                && parent.contents().iter().skip(1).any(|item| item.same_reference(slot))
+        });
+        let copy_sources = |share: bool| {
+            if share {
+                return if matches!(target, Target::Slot(_)) {
+                    view.share_output_sources(&target)
+                } else {
+                    Vec::new()
+                };
+            }
+            view.canvas
+                .cards
+                .iter()
+                .map(|card| (card.node.clone(), card.id))
+                .collect()
+        };
+        let move_sources = copy_sources(false);
+        let share_sources = copy_sources(true);
+        let move_label = if view.history().is_some() {
+            "Move node…"
+        } else {
+            "Connect existing…"
+        };
+        let group_inputs = matches!(target, Target::Slot(_))
+            .then(|| group_scope(&target).map(|group| view.group_inputs(&group)))
+            .flatten()
+            .unwrap_or_default();
+
+        let replace = command.clone();
+        let replace_menu = PopupMenu::build(window, cx, move |menu, _, _| {
+            let replace = replace.clone();
+            node_catalog(menu, move |identity, window, cx| {
+                replace.run(window, cx, |view, key, window, cx| {
+                    view.canvas_replace(
+                        key,
+                        view.revision,
+                        view.selection_serial,
+                        Some(identity),
+                        window,
+                        cx,
+                    );
+                });
+            })
+            .scrollable(true)
+        });
+        menu = menu.item(PopupMenuItem::submenu(
+            if occupied {
+                "Replace node…"
+            } else {
+                "Add node…"
+            },
+            replace_menu,
+        ));
+        if editable_node {
+            let insert = command.clone();
+            let submenu = PopupMenu::build(window, cx, move |menu, _, _| {
+                let insert = insert.clone();
+                node_catalog_choices(menu, NODES_WITH_INPUTS, move |identity, window, cx| {
+                    insert.run(window, cx, |view, key, window, cx| {
+                        view.canvas_insert_below(
+                            key,
+                            view.revision,
+                            view.selection_serial,
+                            identity,
+                            window,
+                            cx,
+                        );
+                    });
+                })
+                .scrollable(true)
+            });
+            menu = menu.item(PopupMenuItem::submenu("Insert Below…", submenu));
+        }
+        if editable_node || !occupied {
+            menu = menu.item(command.item("Group branch", Self::group_selected_branch));
+        }
+        for (label, share, sources) in [
+            (move_label, false, move_sources),
+            ("Share output…", true, share_sources),
+        ] {
+            let sources: Vec<_> = sources
+                .into_iter()
+                .filter(|(source, _)| {
+                    node.as_ref()
+                        .is_none_or(|node| !source.same_reference(node))
+                })
+                .collect();
+            if sources.is_empty() {
+                continue;
+            }
+            let target = command.clone();
+            let submenu = PopupMenu::build(window, cx, move |mut menu, _, _| {
+                for (node, id) in &sources {
+                    let target = target.clone();
+                    let source = node.clone();
+                    let name = String::from_utf16_lossy(&node.identity_name());
+                    menu = menu.item(PopupMenuItem::new(format!("{name} · {id}")).on_click(
+                        move |_, window, cx| {
+                            target.run(window, cx, |view, key, window, cx| {
+                                let drag = WireDrag {
+                                    revision: view.revision,
+                                    selection_serial: Cell::new(view.selection_serial),
+                                    node: source.clone(),
+                                    share,
+                                };
+                                view.canvas_connect(key, &drag, window, cx);
+                            })
+                        },
+                    ));
+                }
+                menu.scrollable(true)
+            });
+            menu = menu.item(PopupMenuItem::submenu(label, submenu));
+        }
+        if !group_inputs.is_empty() {
+            let target = command.clone();
+            let submenu = PopupMenu::build(window, cx, move |menu, _, _| {
+                Self::group_input_menu(menu, &target.view, &target.key, &group_inputs)
+            });
+            menu = menu.item(PopupMenuItem::submenu("Use group input", submenu));
+        }
+        if supports_contents(kind) {
+            menu = menu.item(command.item("Add contents branch", Self::add_group_contents));
+        }
+        if removable_contents {
+            menu = menu.item(command.item("Remove contents branch", Self::remove_group_contents));
+        }
+        if matches!(kind, Some(mycela_engine::PointwiseKind::TemplateLab(_))) {
+            menu =
+                menu.item(command.item("Convert Lab to Basic Nodes", Self::convert_selected_lab));
+        }
+        if occupied {
+            menu = menu.separator();
+            if editable_node {
+                menu = menu.item(command.item("Delete Current", Self::delete_current));
+            }
+            menu = menu.item(command.item("Clear input", |view, window, cx| {
+                view.replace(None, window, cx);
+            }));
+        }
+        menu
+    }
+
     pub(super) fn graph_view_menu(
         &self,
         unavailable: bool,
@@ -1001,7 +1297,7 @@ impl GraphDocumentView {
     }
 
     fn canvas_place_card(&mut self, drag: &CardDrag, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.canvas_current(drag.wire.revision, drag.wire.selection_serial, cx) {
+        if !self.canvas_current(drag.wire.revision, drag.wire.selection_serial.get(), cx) {
             return;
         }
         let Some(target) = self.navigation.target(&drag.key).filter(|target| {
@@ -1022,7 +1318,8 @@ impl GraphDocumentView {
             .cards
             .iter()
             .any(|card| card.key == drag.key && card.receiver.is_some());
-        if docked {
+        let texture_output = matches!(target, Target::Branch(0, _));
+        if docked || texture_output {
             if self.canvas.group().is_some() {
                 self.error =
                     Some("Drop on another input to move this node within its group.".into());
@@ -1030,21 +1327,33 @@ impl GraphDocumentView {
                 return;
             }
             self.ensure_history_binding();
-            if self.history().is_none() {
+            if !texture_output && self.history().is_none() {
                 self.error = Some("This graph cannot detach the node from its input.".into());
                 cx.notify();
                 return;
             }
             let offset = self.canvas.branch_position(position);
+            let output_anchor = texture_output
+                .then(|| self.canvas_output_screen(window))
+                .flatten();
             let stamp = self.begin_history_edit();
-            let result = guard(&self.document).append_branch_at(drag.wire.node.clone(), offset);
+            let result = if texture_output {
+                guard(&self.document).detach_texture_output_at(offset)
+            } else {
+                guard(&self.document).append_branch_at(drag.wire.node.clone(), offset)
+            };
             self.error = result.err().map(model::failure);
             self.finish_history_edit(stamp, self.error.is_none());
             if self.error.is_none() {
                 self.revision += 1;
                 self.selection_serial += 1;
                 self.rebuild(window, cx);
-                self.anchor_dragged_card(drag, cursor, window);
+                if texture_output {
+                    self.restore_canvas_output(output_anchor, window);
+                } else {
+                    self.anchor_dragged_card(drag, cursor, window);
+                }
+                self.select_canvas_node(&drag.wire.node, window, cx);
                 self.start_preview(cx);
             }
             cx.notify();
@@ -1107,7 +1416,7 @@ impl GraphDocumentView {
             return;
         };
         let viewport = Viewport::new(
-            &GraphBounds::for_cards(&self.canvas.cards),
+            &self.canvas.graph_bounds(),
             self.canvas.viewport_size,
             window.rem_size(),
             self.canvas.zoom,
@@ -1127,7 +1436,7 @@ impl GraphDocumentView {
             self.canvas_place_card(drag, window, cx);
             return;
         }
-        if !self.canvas_current(drag.wire.revision, drag.wire.selection_serial, cx) {
+        if !self.canvas_current(drag.wire.revision, drag.wire.selection_serial.get(), cx) {
             return;
         }
         let ports = canvas_ports(destination);
@@ -1151,6 +1460,102 @@ impl GraphDocumentView {
         if let Some(key) = key {
             self.canvas_connect(&key, &drag.wire, window, cx);
         }
+    }
+
+    pub(super) fn canvas_output_screen(&self, window: &Window) -> Option<Point<Pixels>> {
+        let world = self.canvas.output_position()?;
+        let viewport = self.canvas.viewport(window.rem_size());
+        Some(viewport.surface_point(world) + self.canvas.scroll.offset())
+    }
+
+    pub(super) fn restore_canvas_output(&mut self, screen: Option<Point<Pixels>>, window: &Window) {
+        if let (Some(screen), Some(world)) = (screen, self.canvas.output_position()) {
+            let viewport = Viewport::new(
+                &self.canvas.graph_bounds(),
+                self.canvas.viewport_size,
+                window.rem_size(),
+                self.canvas.zoom,
+            );
+            self.canvas.anchor_at(world, screen, viewport);
+        }
+    }
+
+    fn select_canvas_node(&mut self, node: &Node, window: &mut Window, cx: &mut Context<Self>) {
+        let key = self
+            .canvas
+            .visible_cards()
+            .find(|card| card.node.same_reference(node))
+            .map(|card| card.key.clone());
+        if key.is_some() {
+            self.select(key, window, cx);
+        }
+    }
+
+    fn canvas_dock_output(&mut self, wire: &WireDrag, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.canvas_current(wire.revision, wire.selection_serial.get(), cx) {
+            return;
+        }
+        let current = self
+            .canvas
+            .visible_cards()
+            .any(|card| card.node.same_reference(&wire.node));
+        if current {
+            self.set_canvas_output(&wire.node, window, cx);
+        }
+    }
+
+    fn canvas_dock_library_node(
+        &mut self,
+        drag: &LibraryNodeDrag,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if drag.owner != cx.entity_id()
+            || !self.canvas_current(drag.revision, drag.selection_serial, cx)
+        {
+            return;
+        }
+        match new_graph_node(&drag.identity) {
+            Ok(node) => self.set_canvas_output(&node, window, cx),
+            Err(error) => {
+                self.error = Some(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    fn set_canvas_output(&mut self, node: &Node, window: &mut Window, cx: &mut Context<Self>) {
+        if self.canvas.group().is_some() {
+            return;
+        }
+        let current = self.texture_output();
+        if current
+            .as_ref()
+            .is_some_and(|root| root.same_reference(node))
+        {
+            return;
+        }
+        if let Err(error) = admits(node, &Target::Branch(0, current), 0) {
+            self.error = Some(error);
+            cx.notify();
+            return;
+        }
+        let anchor = self.canvas_output_screen(window);
+        self.ensure_history_binding();
+        let stamp = self.begin_history_edit();
+        let result = guard(&self.document).dock_texture_output(node.clone());
+        self.status = None;
+        self.error = result.err().map(model::failure);
+        self.finish_history_edit(stamp, self.error.is_none());
+        if self.error.is_none() {
+            self.revision += 1;
+            self.selection_serial += 1;
+            self.rebuild(window, cx);
+            self.restore_canvas_output(anchor, window);
+            self.select_canvas_node(node, window, cx);
+            self.start_preview(cx);
+        }
+        cx.notify();
     }
 
     fn canvas_enter_group(
@@ -1343,7 +1748,7 @@ impl GraphDocumentView {
             && let Some(anchor) = anchor
         {
             let viewport = Viewport::new(
-                &GraphBounds::for_cards(&self.canvas.cards),
+                &self.canvas.graph_bounds(),
                 self.canvas.viewport_size,
                 rem,
                 self.canvas.zoom,
@@ -1395,18 +1800,25 @@ impl GraphDocumentView {
     }
 
     fn canvas_socket_screen(&self, key: &str, window: &Window) -> Option<Point<Pixels>> {
+        if matches!(self.navigation.target(key), Some(Target::Branch(0, _))) {
+            return self.canvas_output_screen(window);
+        }
         let world = self.canvas.socket_position(key)?;
         let viewport = self.canvas.viewport(window.rem_size());
         Some(viewport.surface_point(world) + self.canvas.scroll.offset())
     }
 
     fn restore_canvas_socket(&mut self, key: &str, screen: Option<Point<Pixels>>, window: &Window) {
+        if matches!(self.navigation.target(key), Some(Target::Branch(0, _))) {
+            self.restore_canvas_output(screen, window);
+            return;
+        }
         if self.error.is_none()
             && let Some(screen) = screen
             && let Some(world) = self.canvas.socket_position(key)
         {
             let viewport = Viewport::new(
-                &GraphBounds::for_cards(&self.canvas.cards),
+                &self.canvas.graph_bounds(),
                 self.canvas.viewport_size,
                 window.rem_size(),
                 self.canvas.zoom,
@@ -1465,32 +1877,6 @@ impl GraphDocumentView {
         self.start_preview(cx);
     }
 
-    pub(super) fn insert_below_picker(&self, cx: &Context<Self>) -> Option<gpui_kit::AnyElement> {
-        let key = self.selection.clone()?;
-        let node = self.selected_node()?;
-        if node.is_default_input() {
-            return None;
-        }
-        let owner = cx.weak_entity();
-        let revision = self.revision;
-        let serial = self.selection_serial;
-        Some(
-            Button::new("graph-insert-below")
-                .small()
-                .label("Insert Below…")
-                .disabled(self.is_busy())
-                .dropdown_menu(move |menu, _, _| {
-                    let owner = owner.clone();
-                    let key = key.clone();
-                    node_catalog_choices(menu, NODES_WITH_INPUTS, move |identity, window, cx| {
-                        let _ = owner.update(cx, |view, cx| {
-                            view.canvas_insert_below(&key, revision, serial, identity, window, cx);
-                        });
-                    })
-                })
-                .into_any_element(),
-        )
-    }
     fn canvas_connect(
         &mut self,
         key: &str,
@@ -1498,7 +1884,7 @@ impl GraphDocumentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.canvas_current(drag.revision, drag.selection_serial, cx) {
+        if !self.canvas_current(drag.revision, drag.selection_serial.get(), cx) {
             return;
         }
         let Some(target) = self.navigation.target(key) else {
@@ -1526,6 +1912,10 @@ impl GraphDocumentView {
         if !reachable(roots, &drag.node) {
             self.error = Some("The source node is no longer in this document.".into());
             cx.notify();
+            return;
+        }
+        if matches!(target, Target::Branch(0, _)) && !drag.share {
+            self.set_canvas_output(&drag.node, window, cx);
             return;
         }
         if let Err(error) = admits(&drag.node, &target, 0) {
@@ -1578,6 +1968,9 @@ impl GraphDocumentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let moving_selection = self
+            .selected_node()
+            .is_some_and(|selected| selected.same_reference(node));
         self.ensure_history_binding();
         let stamp = self.begin_history_edit();
         self.revision += 1;
@@ -1585,6 +1978,9 @@ impl GraphDocumentView {
         self.error = self.edit_target(target, Some(node)).err();
         self.finish_history_edit(stamp, self.error.is_none());
         self.rebuild(window, cx);
+        if moving_selection && self.error.is_none() {
+            self.select_canvas_node(node, window, cx);
+        }
         self.start_preview(cx);
     }
 
@@ -1684,27 +2080,6 @@ impl GraphDocumentView {
         menu
     }
 
-    pub(super) fn group_input_picker(&self, cx: &Context<Self>) -> Option<gpui_kit::AnyElement> {
-        let key = self.selection.as_deref()?;
-        let group = group_scope(&self.navigation.target(key)?)?;
-        let inputs = self.group_inputs(&group);
-        if inputs.is_empty() {
-            return None;
-        }
-        let key = key.to_string();
-        let owner = cx.weak_entity();
-        Some(
-            Button::new("graph-group-input-reference")
-                .small()
-                .label("Use group input…")
-                .disabled(self.is_busy())
-                .dropdown_menu(move |menu, _, _| {
-                    Self::group_input_menu(menu, &owner, &key, &inputs)
-                })
-                .into_any_element(),
-        )
-    }
-
     fn canvas_insert_document_input(
         &mut self,
         identity: &str,
@@ -1791,6 +2166,86 @@ impl GraphDocumentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        let node = match new_graph_node(identity) {
+            Ok(node) => node,
+            Err(error) => {
+                self.error = Some(model::failure(error));
+                cx.notify();
+                return;
+            }
+        };
+        self.canvas_insert_tree(node, cursor, window, cx);
+    }
+
+    pub(super) fn has_copied_node(cx: &App) -> bool {
+        cx.has_global::<GraphClipboard>()
+    }
+
+    pub(super) fn copy_node_tree(&mut self, cx: &mut Context<Self>) {
+        if self.closed || self.is_busy() || self.overview_open {
+            return;
+        }
+        let Some(node) = self.selected_node().filter(|node| !node.is_default_input()) else {
+            return;
+        };
+        match copy_node_tree(&node) {
+            Ok(snapshot) => {
+                cx.set_global(GraphClipboard(snapshot));
+                self.error = None;
+                self.status = Some(format!(
+                    "Copied {} and its inputs.",
+                    String::from_utf16_lossy(&node.identity_name())
+                ));
+            }
+            Err(error) => self.error = Some(format!("Couldn’t copy the node: {error}")),
+        }
+        cx.notify();
+    }
+
+    pub(super) fn paste_node_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.closed || self.is_busy() || self.overview_open || self.has_field_drafts(cx) {
+            return;
+        }
+        let Some(clipboard) = cx.try_global::<GraphClipboard>() else {
+            return;
+        };
+        let node = match clipboard.0.source_clone() {
+            Ok(node) => node,
+            Err(error) => {
+                self.error = Some(format!("Couldn’t paste the node: {error}"));
+                cx.notify();
+                return;
+            }
+        };
+        let target = self
+            .selection
+            .as_deref()
+            .and_then(|key| self.navigation.target(key));
+        if let Some(target) = target {
+            if !self.canvas_target_current(&target) {
+                self.error = Some("The graph changed. Select the paste destination again.".into());
+                cx.notify();
+                return;
+            }
+            if let Err(error) = admits(&node, &target, 0) {
+                self.error = Some(error);
+                cx.notify();
+                return;
+            }
+            self.commit_canvas_input(&target, &node, window, cx);
+        } else {
+            self.ensure_history_binding();
+            self.canvas_insert_tree(node, None, window, cx);
+        }
+    }
+
+    fn canvas_insert_tree(
+        &mut self,
+        node: Node,
+        cursor: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         use mycela_engine::GtxGraphError;
 
         let group = self.canvas.group().and_then(Node::filter);
@@ -1803,14 +2258,6 @@ impl GraphDocumentView {
             self.rebuild(window, cx);
             return;
         }
-        let node = match new_graph_node(identity) {
-            Ok(node) => node,
-            Err(error) => {
-                self.error = Some(model::failure(error));
-                cx.notify();
-                return;
-            }
-        };
         let input_height = if canvas_ports(&node).is_empty() {
             0.
         } else {
@@ -1872,7 +2319,7 @@ impl GraphDocumentView {
             self.select(Some(key), window, cx);
             if let Some(cursor) = cursor {
                 let viewport = Viewport::new(
-                    &GraphBounds::for_cards(&self.canvas.cards),
+                    &self.canvas.graph_bounds(),
                     self.canvas.viewport_size,
                     window.rem_size(),
                     self.canvas.zoom,
@@ -1975,25 +2422,6 @@ impl GraphDocumentView {
             cx.notify();
         }
     }
-    pub(super) fn connection_picker(&self, cx: &Context<Self>) -> gpui_kit::AnyElement {
-        let sources = self
-            .canvas
-            .cards
-            .iter()
-            .map(|card| (card.node.clone(), card.id))
-            .collect();
-        self.connection_picker_with_sources(cx, false, sources)
-    }
-
-    pub(super) fn share_output_picker(&self, cx: &Context<Self>) -> Option<gpui_kit::AnyElement> {
-        let target = self.navigation.target(self.selection.as_deref()?)?;
-        if !matches!(target, Target::Slot(_)) {
-            return None;
-        }
-        let sources = self.share_output_sources(&target);
-        (!sources.is_empty()).then(|| self.connection_picker_with_sources(cx, true, sources))
-    }
-
     fn share_output_sources(&self, target: &Target) -> Vec<(Node, u64)> {
         let scope = group_scope(target);
         if self.canvas.visible || same_level(self.canvas.group(), scope.as_ref()) {
@@ -2021,60 +2449,6 @@ impl GraphDocumentView {
             .collect()
     }
 
-    fn connection_picker_with_sources(
-        &self,
-        cx: &Context<Self>,
-        share: bool,
-        sources: Vec<(Node, u64)>,
-    ) -> gpui_kit::AnyElement {
-        let owner = cx.weak_entity();
-        let key = self.selection.clone();
-        let revision = self.revision;
-        let serial = self.selection_serial;
-        let label = if share {
-            "Share output…"
-        } else if self.history().is_some() {
-            "Move node…"
-        } else {
-            "Connect existing…"
-        };
-        let id = if share {
-            "graph-share-output"
-        } else {
-            "graph-connect-existing"
-        };
-        Button::new(id)
-            .small()
-            .label(label)
-            .disabled(self.is_busy() || key.is_none() || sources.is_empty())
-            .dropdown_menu(move |mut menu, _, _| {
-                for (node, id) in &sources {
-                    let owner = owner.clone();
-                    let key = key.clone();
-                    let drag = WireDrag {
-                        revision,
-                        selection_serial: serial,
-                        node: node.clone(),
-                        share,
-                    };
-                    menu = menu.item(
-                        PopupMenuItem::new(format!(
-                            "{} · {}",
-                            String::from_utf16_lossy(&node.identity_name()),
-                            id
-                        ))
-                        .on_click(move |_, w, cx| {
-                            if let Some(key) = &key {
-                                let _ =
-                                    owner.update(cx, |v, cx| v.canvas_connect(key, &drag, w, cx));
-                            }
-                        }),
-                    );
-                }
-                menu.scrollable(true)
-            })
-            .into_any_element()
-    }
     fn canvas_socket_menu(
         &self,
         button: Button,
@@ -2131,7 +2505,7 @@ impl GraphDocumentView {
                     let key = menu_key.clone();
                     let drag = WireDrag {
                         revision,
-                        selection_serial: serial,
+                        selection_serial: Cell::new(serial),
                         node: source.clone(),
                         share: false,
                     };
@@ -2248,7 +2622,16 @@ impl GraphDocumentView {
         let destination = source
             .map(|node| String::from_utf16_lossy(&node.identity_name()))
             .unwrap_or_else(|| "Not connected".into());
-        div()
+        let busy = self.is_busy();
+        let ready = !busy && !self.has_field_drafts(cx);
+        let revision = self.revision;
+        let serial = self.selection_serial;
+        let highlight = theme.primary;
+        let output_key =
+            self.navigation.rows.iter().find_map(|row| {
+                matches!(row.target, Target::Branch(0, _)).then(|| row.key.clone())
+            });
+        let plaque = div()
             .id("graph-texture-output")
             .aria_label(format!("{TEXTURE_OUTPUT_LABEL} · {destination}"))
             .test_support()
@@ -2271,7 +2654,55 @@ impl GraphDocumentView {
                     .text_center()
                     .text_color(theme.muted_foreground)
                     .child(destination),
-            )
+            );
+        div()
+            .id("graph-texture-output-slot")
+            .test_support()
+            .v_flex()
+            .items_center()
+            .w(rem * CARD_WIDTH)
+            .when(!busy, |slot| {
+                slot.on_drop::<CardDrag>(cx.listener(|view, drag: &CardDrag, window, cx| {
+                    cx.stop_propagation();
+                    view.canvas_dock_output(&drag.wire, window, cx);
+                }))
+                .on_drop::<WireDrag>(cx.listener(|view, drag, window, cx| {
+                    cx.stop_propagation();
+                    view.canvas_dock_output(drag, window, cx);
+                }))
+                .on_drop::<LibraryNodeDrag>(cx.listener(|view, drag, window, cx| {
+                    cx.stop_propagation();
+                    view.canvas_dock_library_node(drag, window, cx);
+                }))
+                .when_some(output_key, |slot, key| {
+                    slot.on_click(cx.listener(move |view, _, window, cx| {
+                        view.canvas_select(key.clone(), revision, serial, window, cx);
+                    }))
+                })
+            })
+            .child(div().size(rem * CARD_WIDTH).when(source.is_none(), |body| {
+                body.v_flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(theme.muted_foreground)
+                    .bg(theme.muted)
+                    .text_color(theme.muted_foreground)
+                    .text_size((rem * 0.8).max(px(10.)))
+                    .child("Drop a node tree here")
+                    .when(ready, |body| {
+                        body.drag_over::<CardDrag>(move |style, _, _, _| {
+                            style.border_color(highlight)
+                        })
+                        .drag_over::<WireDrag>(move |style, _, _, _| style.border_color(highlight))
+                        .drag_over::<LibraryNodeDrag>(
+                            move |style, _, _, _| style.border_color(highlight),
+                        )
+                    })
+            }))
+            .child(div().w(px(1.)).h(rem * 1.2).bg(theme.muted_foreground))
+            .child(plaque)
     }
 
     pub(super) fn render_canvas(
@@ -2424,7 +2855,8 @@ impl GraphDocumentView {
             .h(viewport.surface.height)
             .on_scroll_wheel(cx.listener(Self::wheel_canvas_zoom))
             .child(edges);
-        if cards.is_empty() {
+        let top_level = self.canvas.group().is_none();
+        if cards.is_empty() && !top_level {
             surface = surface.child(
                 div()
                     .p_4()
@@ -2433,25 +2865,14 @@ impl GraphDocumentView {
                     .child("Choose a node from the library."),
             );
         }
-        let top_level = self.canvas.group().is_none();
         let root = top_level.then(|| self.texture_output()).flatten();
-        if let Some(card) = cards.iter().find(|card| {
-            card.texture_output
-                && root
-                    .as_ref()
-                    .is_some_and(|node| node.same_reference(&card.node))
-        }) {
-            let [x, y] = card.body_position();
-            let origin = viewport.surface_point([x, y + CARD_WIDTH]);
+        if let Some(position) = self.canvas.output_position() {
+            let origin = viewport.surface_point(position);
             surface = surface.child(
                 div()
                     .absolute()
                     .left(origin.x)
                     .top(origin.y)
-                    .w(rem * CARD_WIDTH)
-                    .v_flex()
-                    .items_center()
-                    .child(div().w(px(1.)).h(rem * 1.2).bg(theme.muted_foreground))
                     .child(self.texture_output_terminal(root.as_ref(), rem, cx)),
             );
         }
@@ -2480,7 +2901,7 @@ impl GraphDocumentView {
             }
             let payload = WireDrag {
                 revision,
-                selection_serial: serial,
+                selection_serial: Cell::new(serial),
                 node: card.node.clone(),
                 share: card.node.parent().is_some(),
             };
@@ -2491,6 +2912,8 @@ impl GraphDocumentView {
                 "Output · drag to an input"
             };
             let card_id = card.id;
+            let body_key = key.clone();
+            let handle_key = key.clone();
             let output_frame = frame.clone();
             let body_origin = viewport.surface_point(card.body_position());
             let output = div()
@@ -2522,17 +2945,20 @@ impl GraphDocumentView {
             let output = if busy {
                 output
             } else {
-                output.block_mouse_except_scroll().cursor_grab().on_drag(
-                    payload,
-                    move |drag, _, _, cx| {
+                output
+                    .block_mouse_except_scroll()
+                    .cursor_grab()
+                    .on_click(cx.listener(move |view, _, window, cx| {
+                        view.canvas_select(handle_key.clone(), revision, serial, window, cx);
+                    }))
+                    .on_drag(payload, move |drag, _, _, cx| {
                         cx.new(|_| {
                             GraphDragLabel(format!(
                                 "{output_verb} {}",
                                 String::from_utf16_lossy(&drag.node.identity_name())
                             ))
                         })
-                    },
-                )
+                    })
             };
             let title_key = key.clone();
             let mut header = div()
@@ -2598,12 +3024,13 @@ impl GraphDocumentView {
                 key: card.key.clone(),
                 wire: WireDrag {
                     revision,
-                    selection_serial: serial,
+                    selection_serial: Cell::new(serial),
                     node: card.node.clone(),
                     share: false,
                 },
                 grab: self.canvas.card_grab.clone(),
             };
+            let drag_owner = cx.weak_entity();
             let grab = card_drag.grab.clone();
             let occurrence = card.node.occurrence_id();
             let receiver_frame = frame.clone();
@@ -2632,6 +3059,11 @@ impl GraphDocumentView {
                 .rounded_sm()
                 .when(!busy, |body| {
                     body.cursor_grab()
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            if view.selection.as_deref() != Some(body_key.as_str()) {
+                                view.canvas_select(body_key.clone(), revision, serial, window, cx);
+                            }
+                        }))
                         .on_mouse_down(MouseButton::Left, move |event, _, _| {
                             grab.set(Some(CardGrab {
                                 card: occurrence,
@@ -2641,7 +3073,7 @@ impl GraphDocumentView {
                         .drag_over::<CardDrag>(move |style, drag, _, _| {
                             if library_drop_ready
                                 && drag.wire.revision == revision
-                                && drag.wire.selection_serial == serial
+                                && drag.wire.selection_serial.get() == serial
                             {
                                 style.border_color(hover_border)
                             } else {
@@ -2661,7 +3093,24 @@ impl GraphDocumentView {
                                 }
                             })
                         })
-                        .on_drag(card_drag, move |drag, offset, _, cx| {
+                        .on_drag(card_drag, move |drag, offset, window, cx| {
+                            let _ = drag_owner.update(cx, |view, cx| {
+                                let serial = drag.wire.selection_serial.get();
+                                if view.selection.as_deref() != Some(drag.key.as_str())
+                                    && view.canvas_current(drag.wire.revision, serial, cx)
+                                {
+                                    view.canvas_select(
+                                        drag.key.clone(),
+                                        drag.wire.revision,
+                                        serial,
+                                        window,
+                                        cx,
+                                    );
+                                    if view.selection.as_deref() == Some(drag.key.as_str()) {
+                                        drag.wire.selection_serial.set(view.selection_serial);
+                                    }
+                                }
+                            });
                             if drag.grab_offset().is_none() {
                                 drag.grab.set(Some(CardGrab {
                                     card: occurrence,
@@ -2674,7 +3123,23 @@ impl GraphDocumentView {
                                 height: body_height,
                             })
                         })
-                        .when(card.receiver.is_none(), |body| {
+                        .when(card.texture_output, |body| {
+                            body.on_drop::<CardDrag>(cx.listener(
+                                |view, drag: &CardDrag, window, cx| {
+                                    cx.stop_propagation();
+                                    view.canvas_dock_output(&drag.wire, window, cx);
+                                },
+                            ))
+                            .on_drop::<WireDrag>(cx.listener(|view, drag, window, cx| {
+                                cx.stop_propagation();
+                                view.canvas_dock_output(drag, window, cx);
+                            }))
+                            .on_drop::<LibraryNodeDrag>(cx.listener(|view, drag, window, cx| {
+                                cx.stop_propagation();
+                                view.canvas_dock_library_node(drag, window, cx);
+                            }))
+                        })
+                        .when(card.receiver.is_none() && !card.texture_output, |body| {
                             body.on_drop::<CardDrag>(cx.listener(move |view, drag, window, cx| {
                                 view.canvas_drop_on_card(drag, &drag_node, window, cx)
                             }))
@@ -2787,7 +3252,7 @@ impl GraphDocumentView {
                 .drag_over::<CardDrag>(move |style, drag, _, _| {
                     if library_drop_ready
                         && drag.wire.revision == revision
-                        && drag.wire.selection_serial == serial
+                        && drag.wire.selection_serial.get() == serial
                     {
                         style.bg(drop_background).border_color(drop_border)
                     } else {
@@ -2829,12 +3294,12 @@ impl GraphDocumentView {
                     ),
                 ));
             }
-            let body = if let Some(receiver) = card
+            let docked_socket = card
                 .receiver
                 .as_ref()
                 .and_then(|key| visible_card_ids.get(key))
-                && let Some(row) = self.navigation.rows.iter().find(|row| row.key == card.key)
-            {
+                .zip(self.navigation.rows.iter().find(|row| row.key == card.key));
+            if let Some((_, row)) = docked_socket {
                 let name = row
                     .label
                     .split_once(": ")
@@ -2862,16 +3327,32 @@ impl GraphDocumentView {
                         .left(rem * 0.35)
                         .child(label),
                 );
-                self.canvas_socket_target(
-                    &card.key,
-                    node.into_any_element(),
-                    frame.clone(),
-                    *receiver,
-                    rem,
-                    cx,
-                )
-            } else {
+            }
+            let menu_owner = cx.weak_entity();
+            let menu_key = card.key.clone();
+            let node = if busy {
                 node.into_any_element()
+            } else {
+                node.context_menu(move |menu, window, cx| {
+                    let _ = menu_owner.update(cx, |view, cx| {
+                        if view.selection.as_deref() != Some(menu_key.as_str()) {
+                            view.canvas_select(
+                                menu_key.clone(),
+                                view.revision,
+                                view.selection_serial,
+                                window,
+                                cx,
+                            );
+                        }
+                    });
+                    Self::build_node_commands(menu, &menu_owner, &menu_key, window, cx)
+                })
+                .into_any_element()
+            };
+            let body = if let Some((receiver, _)) = docked_socket {
+                self.canvas_socket_target(&card.key, node, frame.clone(), *receiver, rem, cx)
+            } else {
+                node
             };
             let mut stack = div()
                 .id(("graph-card", card.id as usize))
@@ -2933,10 +3414,20 @@ impl GraphDocumentView {
                         scroll.cursor_grabbing()
                     })
                     .on_mouse_down(MouseButton::Right, cx.listener(Self::begin_canvas_pan))
+                    .capture_any_mouse_down(cx.listener(
+                        |view, event: &gpui_kit::MouseDownEvent, window, cx| {
+                            if event.button == MouseButton::Middle {
+                                view.begin_canvas_pan(event, window, cx);
+                                cx.stop_propagation();
+                            }
+                        },
+                    ))
                     .on_mouse_move(cx.listener(Self::move_canvas_pan))
                     .on_mouse_up(MouseButton::Right, cx.listener(Self::end_canvas_pan))
                     .on_mouse_up_out(MouseButton::Right, cx.listener(Self::end_canvas_pan))
-                    .on_drop::<CardDrag>(cx.listener(|view, drag, window, cx| {
+                    .on_mouse_up(MouseButton::Middle, cx.listener(Self::end_canvas_pan))
+                    .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::end_canvas_pan))
+                    .on_drop::<CardDrag>(cx.listener(|view, drag: &CardDrag, window, cx| {
                         view.canvas_place_card(drag, window, cx)
                     }))
                     .on_drop::<LibraryNodeDrag>(cx.listener(Self::canvas_drop_library_node))
@@ -3010,14 +3501,6 @@ impl GraphDocumentView {
                 view.keyboard_canvas_pan([0., -1.], window, cx);
             }))
             .child(self.canvas_view_controls(busy, cx))
-            .when(top_level && root.is_none(), |graph| {
-                graph.child(
-                    div()
-                        .px_3()
-                        .pb_2()
-                        .child(self.texture_output_terminal(None, window_rem, cx)),
-                )
-            })
             .when(!self.canvas.groups.is_empty(), |view| {
                 let current = self.canvas.groups.len();
                 view.child(

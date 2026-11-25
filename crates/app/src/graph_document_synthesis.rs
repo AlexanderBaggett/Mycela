@@ -1,5 +1,6 @@
 //! Synthesis layers and controls in the graph inspector.
 use super::*;
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use gpui_kit::{AnyElement, WeakEntity};
 use mycela_engine::{
     EnvironmentBlendMode, EnvironmentImage, ImageGeometry, LabAdjusterMetadata, SynthesisAdjuster,
@@ -663,11 +664,17 @@ impl GraphDocumentView {
                 let (linked_value, menu) =
                     links.map_or((None, None), |links| (links.value, links.menu));
                 let field_value = linked_value.unwrap_or_else(|| {
-                    Input::new(input)
-                        .id((group, index))
-                        .small()
-                        .disabled(busy || panel.number_controls_disabled(*field))
-                        .into_any_element()
+                    NumericField::new(
+                        input,
+                        (group, index),
+                        field.label(),
+                        NumericRange::bounds(
+                            field.range(),
+                            if field.is_whole() { 1.0 } else { 0.01 },
+                        ),
+                    )
+                    .disabled(busy || panel.number_controls_disabled(*field))
+                    .into_any_element()
                 });
                 Field::new().label(field.label()).child(
                     div()

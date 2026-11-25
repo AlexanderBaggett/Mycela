@@ -1,3 +1,4 @@
+use super::numeric_field::{NumericField, NumericRange};
 use super::synthesis::{PatchInputRequests, PatchInputSizes};
 use super::*;
 use gpui_kit::SharedString;
@@ -36,6 +37,7 @@ impl SelectItem for AdjusterOption {
 struct AdjusterForm {
     fields: AdjusterFields,
     range: Option<[f64; 2]>,
+    slider_range: Option<NumericRange>,
     error: Option<String>,
     patch_inputs: PatchInputDraft,
 }
@@ -197,13 +199,18 @@ pub(super) fn number_field(
 impl Render for AdjusterForm {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
+        let numeric = |input, id, label| {
+            Field::new()
+                .label(label)
+                .child(NumericField::new(input, id, label, self.slider_range))
+        };
         let fields = match &self.fields {
             AdjusterFields::Number(input) => {
-                Form::new().child(number_field(input, "lab-adjuster-number", "Value"))
+                Form::new().child(numeric(input, "lab-adjuster-number", "Value"))
             }
             AdjusterFields::Dual([x, y]) => Form::new()
-                .child(number_field(x, "lab-adjuster-x", "X"))
-                .child(number_field(y, "lab-adjuster-y", "Y")),
+                .child(numeric(x, "lab-adjuster-x", "X"))
+                .child(numeric(y, "lab-adjuster-y", "Y")),
             AdjusterFields::Selection(input) => Form::new().child(
                 Field::new().label("Option").child(
                     Select::new(input)
@@ -443,6 +450,12 @@ impl GraphDocumentView {
             let mut form = AdjusterForm {
                 fields,
                 range: control.range(),
+                slider_range: control.range_settings().map(|settings| {
+                    NumericRange::bounds(
+                        settings.bounds(),
+                        if settings.whole_numbers() { 1.0 } else { 0.01 },
+                    )
+                }),
                 error: None,
                 patch_inputs: PatchInputDraft::default(),
             };

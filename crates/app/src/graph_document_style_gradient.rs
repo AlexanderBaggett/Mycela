@@ -1,6 +1,7 @@
 //! The Gradient and Noise paint ramps share the graph's retained Gradient operations.
 use super::super::gradient::GradientEditor;
 use super::*;
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use mycela_engine::{GradientEntry, GradientRecord, SharedGradient};
 
 #[derive(Clone, Copy)]
@@ -316,14 +317,20 @@ impl Draft {
                         .children(self.fields.iter().enumerate().map(
                             |(index, (label, _, input))| {
                                 Field::new().label(*label).child(
-                                    Input::new(input)
-                                        .id(gpui_kit::ElementId::named_usize(
+                                    NumericField::new(
+                                        input,
+                                        gpui_kit::ElementId::named_usize(
                                             format!("{id}-value"),
                                             index,
-                                        ))
-                                        .aria_label(*label)
-                                        .small()
-                                        .disabled(disabled || self.editor.is_changed(cx)),
+                                        ),
+                                        *label,
+                                        if index == 0 {
+                                            gradient_position_range(&self.editor)
+                                        } else {
+                                            NumericRange::new(0.0, 1.0, 0.001)
+                                        },
+                                    )
+                                    .disabled(disabled || self.editor.is_changed(cx)),
                                 )
                             },
                         )),
@@ -331,11 +338,13 @@ impl Draft {
             })
             .child(
                 Field::new().label("New stop position").child(
-                    Input::new(&self.editor.position)
-                        .id(format!("{id}-new-position"))
-                        .aria_label("New stop position")
-                        .small()
-                        .disabled(buttons_disabled),
+                    NumericField::new(
+                        &self.editor.position,
+                        format!("{id}-new-position"),
+                        "New stop position",
+                        gradient_position_range(&self.editor),
+                    )
+                    .disabled(buttons_disabled),
                 ),
             )
             .child(
@@ -357,6 +366,10 @@ impl Draft {
                     )),
             )
     }
+}
+
+fn gradient_position_range(editor: &GradientEditor) -> NumericRange {
+    NumericRange::new(0.0, f64::from(editor.width().saturating_sub(1).max(0)), 1.0)
 }
 
 fn position(text: &str, width: i32) -> Result<i32, String> {

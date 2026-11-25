@@ -25,6 +25,7 @@ pub use canvas::{
 };
 pub(crate) use canvas::{EnvironmentPaintEdit, SynthesisPaint, TextureEdit};
 mod caustics;
+mod checkerboard;
 mod combine;
 mod combine_arrays;
 pub(crate) mod convert_environment;

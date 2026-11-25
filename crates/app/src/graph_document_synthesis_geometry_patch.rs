@@ -1,5 +1,6 @@
 //! Shared whole-contour handles and hit testing for both Patches source views.
 use super::*;
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use mycela_engine::{
     SynthesisPatchResizeHandle, SynthesisPatchTransform, SynthesisPatchTransformBounds,
     SynthesisPatchTransformField,
@@ -106,12 +107,17 @@ impl TransformNumbers {
                         SynthesisPatchTransformField::Width => "Width (%)",
                         SynthesisPatchTransformField::Height => "Height (%)",
                     };
+                    let limits = field.limits();
                     Field::new().label(label).child(
-                        Input::new(input)
-                            .id((id, index))
-                            .small()
-                            .aria_label(label)
-                            .disabled(disabled),
+                        NumericField::new(
+                            input,
+                            (id, index),
+                            label,
+                            NumericRange::bounds(limits, 0.01),
+                        )
+                        .focus_travel(limits.map(|limit| limit.clamp(-100.0, 100.0)))
+                        .submit_on_release()
+                        .disabled(disabled),
                     )
                 }),
         )

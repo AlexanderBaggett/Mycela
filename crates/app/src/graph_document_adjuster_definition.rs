@@ -1,5 +1,6 @@
 use super::{
     numeric_adjusters::{PatchInputDraft, number_field},
+    numeric_field::{NumericField, NumericRange},
     *,
 };
 use gpui_kit::component::radio::{Radio, RadioGroup};
@@ -13,6 +14,7 @@ struct OptionDraft {
     id: usize,
     name: Entity<InputState>,
     value: Entity<InputState>,
+    slider_range: NumericRange,
     original_name: Option<Vec<u16>>,
 }
 
@@ -23,10 +25,12 @@ impl OptionDraft {
             .as_deref()
             .map_or_else(String::new, String::from_utf16_lossy);
         let value = record.value.to_string();
+        let slider_range = NumericRange::new(0.0, 100.0, 0.1).including(record.value);
         Self {
             id,
             name: cx.new(|cx| InputState::new(window, cx).default_value(name)),
             value: cx.new(|cx| InputState::new(window, cx).default_value(value)),
+            slider_range,
             original_name: record.name,
         }
     }
@@ -276,16 +280,14 @@ impl Render for DefinitionForm {
                                                     )),
                                             ),
                                         )
-                                        .child(
-                                            Field::new().label("Value").child(
-                                                Input::new(&option.value)
-                                                    .id(format!("lab-option-value-{id}"))
-                                                    .aria_label(format!(
-                                                        "Option {} value",
-                                                        index + 1
-                                                    )),
+                                        .child(Field::new().label("Value").child(
+                                            NumericField::new(
+                                                &option.value,
+                                                format!("lab-option-value-{id}"),
+                                                format!("Option {} value", index + 1),
+                                                option.slider_range,
                                             ),
-                                        ),
+                                        )),
                                 )
                                 .child(
                                     div()

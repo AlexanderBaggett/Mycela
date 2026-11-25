@@ -11,6 +11,17 @@ impl GraphDocumentView {
         cx: &Context<Self>,
     ) -> impl IntoElement + use<> {
         let owner = cx.weak_entity();
+        let edit_owner = owner.clone();
+        let selected_node = self
+            .selection
+            .clone()
+            .filter(|_| !busy && !results_visible && !self.overview_open);
+        let node_commands = !busy && !results_visible && !self.overview_open;
+        let can_copy = node_commands
+            && self
+                .selected_node()
+                .is_some_and(|node| !node.is_default_input());
+        let can_paste = node_commands && Self::has_copied_node(cx) && !self.has_field_drafts(cx);
         let workspace = self.workspace.clone();
         let file = Button::new("graph-open")
             .small()
@@ -20,6 +31,8 @@ impl GraphDocumentView {
             .dropdown_menu(move |menu, window, cx| {
                 let import = owner.clone();
                 let gtx = owner.clone();
+                let save = owner.clone();
+                let save_as = owner.clone();
                 menu.when_some(workspace.clone(), |menu, workspace| {
                     menu.item(PopupMenuItem::new("New document").disabled(busy).on_click(
                         move |_, window, cx| {
@@ -48,12 +61,18 @@ impl GraphDocumentView {
                 .item(
                     PopupMenuItem::new("Save")
                         .disabled(busy)
-                        .action(Box::new(SaveDocument)),
+                        .action(Box::new(SaveDocument))
+                        .on_click(move |_, _, cx| {
+                            let _ = save.update(cx, |view, cx| view.save(false, cx));
+                        }),
                 )
                 .item(
-                    PopupMenuItem::new("Save Mycela project as…")
+                    PopupMenuItem::new("Save As…")
                         .disabled(busy)
-                        .action(Box::new(SaveDocumentAs)),
+                        .action(Box::new(SaveDocumentAs))
+                        .on_click(move |_, _, cx| {
+                            let _ = save_as.update(cx, |view, cx| view.save(true, cx));
+                        }),
                 )
                 .item(
                     PopupMenuItem::new("Save Genetica GTX copy…")
@@ -62,6 +81,13 @@ impl GraphDocumentView {
                             let _ = gtx.update(cx, |view, cx| view.save_gtx_copy(window, cx));
                         }),
                 )
+                .when(workspace.is_some(), |menu| {
+                    menu.item(
+                        PopupMenuItem::new("Rename document…")
+                            .disabled(busy)
+                            .action(Box::new(RenameDocument)),
+                    )
+                })
                 .when(!busy && workspace.is_some(), |menu| {
                     Self::recent_save_commands(menu, &owner, window, cx)
                 })
@@ -97,7 +123,7 @@ impl GraphDocumentView {
             .ghost()
             .tab_index(0)
             .label("Edit")
-            .dropdown_menu(move |menu, _, _| {
+            .dropdown_menu(move |menu, window, cx| {
                 menu.item(
                     PopupMenuItem::new("Undo")
                         .disabled(!can_undo)
@@ -108,6 +134,24 @@ impl GraphDocumentView {
                         .disabled(!can_redo)
                         .action(Box::new(RedoGraphEdit)),
                 )
+                .separator()
+                .item(
+                    PopupMenuItem::new("Copy node and inputs")
+                        .disabled(!can_copy)
+                        .action(Box::new(CopyNodeTree)),
+                )
+                .item(
+                    PopupMenuItem::new("Paste into selection")
+                        .disabled(!can_paste)
+                        .action(Box::new(PasteNodeTree)),
+                )
+                .when_some(selected_node.clone(), |menu, key| {
+                    let owner = edit_owner.clone();
+                    menu.separator()
+                        .submenu("Node actions", window, cx, move |menu, window, cx| {
+                            Self::build_node_commands(menu, &owner, &key, window, cx)
+                        })
+                })
             });
         div()
             .id("graph-command-menu")

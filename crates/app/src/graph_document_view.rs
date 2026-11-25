@@ -58,6 +58,8 @@ mod node_library;
 mod node_previews;
 #[path = "graph_document_numeric_adjusters.rs"]
 mod numeric_adjusters;
+#[path = "graph_document_numeric_field.rs"]
+pub(super) mod numeric_field;
 #[path = "graph_document_numeric_links.rs"]
 mod numeric_links;
 #[path = "graph_document_overview.rs"]
@@ -76,6 +78,8 @@ mod preview_maps;
 mod recent_paths;
 #[path = "graph_document_region.rs"]
 mod region;
+#[path = "graph_document_rename.rs"]
+mod rename;
 #[path = "graph_document_results.rs"]
 mod results;
 #[path = "graph_document_selector.rs"]
@@ -94,7 +98,9 @@ use super::{
     navigation::{Navigation, Target},
 };
 use crate::{ForegroundError, LIVE_PREVIEW_SIZE};
-use gpui_kit::base::{Disableable, InteractiveElementExt, Selectable, StyledExt, TestSupportExt};
+use gpui_kit::base::{
+    Disableable, ElementExt, InteractiveElementExt, Selectable, StyledExt, TestSupportExt,
+};
 use gpui_kit::component::{
     ActiveTheme, Sizable, WindowExt,
     button::{Button, ButtonVariant, ButtonVariants},
@@ -105,13 +111,14 @@ use gpui_kit::component::{
     input::{Input, InputEvent, InputState, NumberInput},
     list::ListItem,
     menu::{DropdownMenu, PopupMenu, PopupMenuItem},
+    progress::Progress,
     scroll::ScrollableElement,
     tab::{Tab, TabBar},
     tree::{Tree, TreeState},
 };
 use gpui_kit::{
     AnyWindowHandle, App, AppContext, Context, Entity, EventEmitter, FocusHandle, IntoElement,
-    Render, Subscription, Task, Window, WindowOptions, div, img, prelude::*, rems,
+    Render, Rgba, Subscription, Task, Window, WindowOptions, div, img, prelude::*, rems,
 };
 use mycela_engine::{
     Gtx375GraphDocument, HistoryDirection, PointwiseError, PointwiseFilter,
@@ -135,11 +142,14 @@ gpui_kit::actions!(
         OpenDocument,
         SaveDocument,
         SaveDocumentAs,
+        RenameDocument,
         RevertGraphFields,
         FocusGraph,
         GroupSelectedBranch,
         RenderSelectedBranch,
         ExportGraphImage,
+        CopyNodeTree,
+        PasteNodeTree,
         UndoGraphEdit,
         RedoGraphEdit,
         RemoveCustomCurvePoint,
@@ -159,11 +169,14 @@ pub(crate) fn bind_keys(cx: &mut App) {
         gpui_kit::KeyBinding::new("secondary-o", OpenDocument, Some("GraphDocument")),
         gpui_kit::KeyBinding::new("secondary-s", SaveDocument, Some("GraphDocument")),
         gpui_kit::KeyBinding::new("secondary-shift-s", SaveDocumentAs, Some("GraphDocument")),
+        gpui_kit::KeyBinding::new("f2", RenameDocument, Some("GraphDocument")),
         gpui_kit::KeyBinding::new("escape", RevertGraphFields, Some("GraphDocument")),
         gpui_kit::KeyBinding::new("secondary-1", FocusGraph, Some("GraphDocument")),
         gpui_kit::KeyBinding::new("secondary-g", GroupSelectedBranch, Some("GraphDocument")),
         gpui_kit::KeyBinding::new("secondary-r", RenderSelectedBranch, Some("GraphDocument")),
         gpui_kit::KeyBinding::new("secondary-shift-e", ExportGraphImage, Some("GraphDocument")),
+        gpui_kit::KeyBinding::new("secondary-c", CopyNodeTree, Some("GraphDocument")),
+        gpui_kit::KeyBinding::new("secondary-v", PasteNodeTree, Some("GraphDocument")),
         gpui_kit::KeyBinding::new("secondary-z", UndoGraphEdit, Some("GraphDocument")),
         gpui_kit::KeyBinding::new("secondary-shift-z", RedoGraphEdit, Some("GraphDocument")),
         gpui_kit::KeyBinding::new("delete", RemoveCustomCurvePoint, Some("CustomCurvePlot")),
@@ -205,6 +218,7 @@ enum Work {
     SavingCurvePreset,
     Saving,
     ChoosingSave,
+    Renaming,
     ChoosingExport,
     Exporting,
     RenderingResult,
@@ -230,6 +244,41 @@ struct PreviewPlayback {
     _timer: Task<()>,
 }
 
+struct SavePathDraft {
+    input: Entity<InputState>,
+    replacement: Option<PathBuf>,
+    error: Option<String>,
+}
+
+impl SavePathDraft {
+    fn confirm(&mut self, cx: &mut Context<Self>) -> Option<PathBuf> {
+        let raw = self.input.read(cx).value();
+        let mut path = PathBuf::from(raw.trim());
+        let result = (|| {
+            if !path.is_absolute() || path.file_name().is_none() {
+                return Err("Enter the full path, including the filename.".into());
+            }
+            if path.extension().is_none() {
+                path.set_extension(DocumentFormat::Mycela.extension());
+            }
+            DocumentFormat::Mycela.validate_save_path(&path)?;
+            if path.try_exists().map_err(model::failure)?
+                && self.replacement.as_ref() != Some(&path)
+            {
+                self.replacement = Some(path);
+                return Ok(None);
+            }
+            Ok(Some(path))
+        })();
+        self.error = result.as_ref().err().cloned();
+        if self.error.is_some() {
+            self.replacement = None;
+        }
+        cx.notify();
+        result.ok().flatten()
+    }
+}
+
 pub(crate) struct SourceAnimationFrame(pub(crate) f64);
 
 /// Owns a live graph document, navigation and drafts. Preview is an owned
@@ -245,6 +294,7 @@ pub struct GraphDocumentView {
     history_router: Option<Arc<history::Router>>,
     path: Option<PathBuf>,
     imported_from: Option<PathBuf>,
+    draft_name: String,
     mesh_import_folder: Option<PathBuf>,
     dirty: bool,
     revision: u64,
@@ -278,6 +328,7 @@ pub struct GraphDocumentView {
     closed: bool,
     work: Option<Work>,
     ticket: Option<Ticket>,
+    save_fallback_path: Option<PathBuf>,
     preview_ticket: Option<Ticket>,
     node_previews: node_previews::NodePreviews,
     node_library: node_library::NodeLibrary,
@@ -486,6 +537,7 @@ impl GraphDocumentView {
             history_router: None,
             path,
             imported_from: None,
+            draft_name: "Untitled".into(),
             mesh_import_folder: None,
             dirty: false,
             revision: 0,
@@ -520,6 +572,7 @@ impl GraphDocumentView {
             closed: false,
             work: None,
             ticket: None,
+            save_fallback_path: None,
             preview_ticket: None,
             node_previews: node_previews::NodePreviews::default(),
             node_library: node_library::NodeLibrary::new(window, cx),
@@ -702,6 +755,7 @@ impl GraphDocumentView {
             .then(|| self.inspector.layer.clone())
             .flatten();
         let old_node = self.inspector.owner.clone();
+        let old_checkerboard_color = self.inspector.checkerboard_color_open;
         let old_gradient_selection = same_selection
             .then(|| self.inspector.legacy_gradient.as_ref()?.selection(cx))
             .flatten();
@@ -764,6 +818,12 @@ impl GraphDocumentView {
                     self.error = Some(error);
                     Inspector::default()
                 });
+                if old_node
+                    .as_ref()
+                    .is_some_and(|old| old.same_reference(&node))
+                {
+                    fields.checkerboard_color_open = old_checkerboard_color;
+                }
                 fields.owner = Some(node);
                 fields
             }
@@ -1353,6 +1413,14 @@ impl GraphDocumentView {
             DocumentFormat::Mycela => (Some(prepared.path), None),
             DocumentFormat::Gtx => (None, Some(prepared.path)),
         };
+        self.draft_name = self
+            .imported_from
+            .as_deref()
+            .and_then(Path::file_stem)
+            .map_or_else(
+                || "Untitled".into(),
+                |name| name.to_string_lossy().into_owned(),
+            );
         self.preview = prepared.preview;
         self.preview_maps = preview_maps::PreviewMaps::default();
         self.preview_display = preview_display::PreviewDisplay::default();
@@ -2733,12 +2801,9 @@ impl GraphDocumentView {
             let inactive =
                 field == mycela_engine::CanvasAreaField::OutlineThickness && !area.outline;
             Some(
-                Field::new().label(draft.label.clone()).child(
-                    Input::new(&draft.input)
-                        .id(draft.id.clone())
-                        .disabled(busy || inactive)
-                        .aria_label(draft.label.clone()),
-                ),
+                Field::new()
+                    .label(draft.label.clone())
+                    .child(draft.control(busy || inactive)),
             )
         });
         Some(
@@ -2912,6 +2977,158 @@ impl GraphDocumentView {
         self.save_as_in_folder(save_as, format, None, cx);
     }
 
+    fn other_open_document_paths(&self, cx: &Context<Self>) -> Vec<PathBuf> {
+        self.workspace
+            .as_ref()
+            .and_then(|owner| owner.upgrade())
+            .map(|workspace| workspace.read(cx).other_document_paths(cx.entity_id(), cx))
+            .unwrap_or_default()
+    }
+
+    fn validate_save_destination(
+        path: &Path,
+        format: DocumentFormat,
+        open_paths: &[PathBuf],
+        source: Option<&Path>,
+    ) -> Result<(), String> {
+        format.validate_save_path(path)?;
+        let canonical_target = std::fs::canonicalize(path).ok();
+        if open_paths.iter().any(|open| {
+            open == path
+                || canonical_target.as_ref().is_some_and(|target| {
+                    std::fs::canonicalize(open).is_ok_and(|open| open == *target)
+                })
+        }) {
+            return Err("That file is already open in another document.".into());
+        }
+        if let Some(source) = source
+            && std::fs::canonicalize(source)
+                .ok()
+                .zip(canonical_target)
+                .is_some_and(|(source, target)| source == target)
+        {
+            return Err("Choose a different filename to preserve the imported GTX.".into());
+        }
+        Ok(())
+    }
+
+    fn open_save_path_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(suggested) = self.save_fallback_path.take() else {
+            return;
+        };
+        if let Some(ticket) = self.ticket.take() {
+            ticket.retire();
+        }
+        self.work = None;
+        self.modal = true;
+        let input =
+            cx.new(|cx| InputState::new(window, cx).default_value(suggested.display().to_string()));
+        let focus = gpui_kit::Focusable::focus_handle(input.read(cx), cx);
+        let focused = Rc::new(Cell::new(false));
+        let draft = cx.new(|_| SavePathDraft {
+            input,
+            replacement: None,
+            error: None,
+        });
+        let owner = cx.weak_entity();
+        window.open_dialog(cx, move |dialog, _, cx| {
+            let close = owner.clone();
+            let save = owner.clone();
+            let editing = draft.clone();
+            let draft = draft.read(cx);
+            let focus = focus.clone();
+            let focused = focused.clone();
+            dialog
+                .title("Save As")
+                .child(
+                    Field::new().label("File path").child(
+                        div()
+                            .relative()
+                            .on_prepaint(move |_, window, cx| {
+                                if !focused.replace(true) {
+                                    window.defer(cx, move |window, cx| focus.focus(window, cx));
+                                }
+                            })
+                            .child(
+                                Input::new(&draft.input)
+                                    .id("graph-save-manual-path")
+                                    .aria_label("File path"),
+                            ),
+                    ),
+                )
+                .when_some(draft.error.clone(), |dialog, error| {
+                    dialog.child(
+                        div()
+                            .id("graph-save-manual-error")
+                            .role(gpui_kit::Role::Alert)
+                            .text_color(cx.theme().danger)
+                            .child(error),
+                    )
+                })
+                .when(draft.replacement.is_some(), |dialog| {
+                    dialog.child("That file already exists. Choose Replace file to confirm.")
+                })
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().trigger(|button| button.label("Cancel")))
+                        .child(DialogAction::new().child(
+                            Button::new("graph-save-manual-confirm").primary().label(
+                                if draft.replacement.is_some() {
+                                    "Replace file"
+                                } else {
+                                    "Save"
+                                },
+                            ),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let Some(path) = editing.update(cx, |draft, cx| draft.confirm(cx)) else {
+                        return false;
+                    };
+                    let _ = save.update(cx, |view, cx| {
+                        view.modal = false;
+                        view.save_to_entered_path(path, cx);
+                    });
+                    true
+                })
+                .on_close(move |_, _, cx| {
+                    let _ = close.update(cx, |view, cx| {
+                        view.modal = false;
+                        cx.notify();
+                    });
+                })
+        });
+        cx.notify();
+    }
+
+    fn save_to_entered_path(&mut self, path: PathBuf, cx: &mut Context<Self>) {
+        let open_paths = self.other_open_document_paths(cx);
+        let source = self.imported_from.clone();
+        let document = self.document.clone();
+        let revision = self.revision;
+        let handle = self.window;
+        let ticket = Ticket::new();
+        let work = ticket.clone();
+        self.ticket = Some(ticket.clone());
+        self.work = Some(Work::Saving);
+        self.error = None;
+        let format = DocumentFormat::Mycela;
+        let pending = cx.background_spawn(async move {
+            Self::validate_save_destination(&path, format, &open_paths, source.as_deref())?;
+            model::save(&document, path, format, &work)
+        });
+        cx.spawn(async move |owner, cx| {
+            let result = pending.await;
+            let _ = cx.update_window(handle, |_, _, cx| {
+                owner.update(cx, |view, cx| {
+                    view.saved(result, &ticket, revision, format, cx)
+                })
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
     fn save_in_recent_folder(&mut self, path: PathBuf, cx: &mut Context<Self>) {
         let window = self.window;
         cx.spawn(async move |owner, cx| {
@@ -2999,32 +3216,26 @@ impl GraphDocumentView {
             .detach();
         } else {
             self.work = Some(Work::ChoosingSave);
-            let open_paths = self
-                .workspace
-                .as_ref()
-                .and_then(|owner| owner.upgrade())
-                .map(|workspace| workspace.read(cx).other_document_paths(cx.entity_id(), cx))
-                .unwrap_or_default();
+            let open_paths = self.other_open_document_paths(cx);
             let suggested = path.as_ref().or(source.as_ref());
             let directory = folder
-                .or_else(|| recent_paths::RecentPaths::folders(cx).first().cloned())
                 .or_else(|| {
                     suggested
                         .and_then(|path| path.parent())
                         .map(Path::to_path_buf)
                 })
+                .or_else(|| recent_paths::RecentPaths::folders(cx).first().cloned())
                 .or_else(dirs::document_dir)
                 .unwrap_or_else(|| PathBuf::from("."));
-            let name = suggested
-                .and_then(|path| path.file_stem())
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Untitled".into());
+            let name = self.suggested_document_stem();
             let suffix = if format == DocumentFormat::Gtx && source.is_some() {
                 "-copy"
             } else {
                 ""
             };
             let name = format!("{name}{suffix}.{}", format.extension());
+            self.save_fallback_path =
+                (format == DocumentFormat::Mycela).then(|| directory.join(&name));
             let prompt = cx.prompt_for_new_path(&directory, Some(&name));
             cx.spawn(async move |owner, cx| {
                 let selected = prompt.await;
@@ -3036,8 +3247,19 @@ impl GraphDocumentView {
                 {
                     return;
                 }
+                if format == DocumentFormat::Mycela && matches!(selected, Ok(Err(_)) | Err(_)) {
+                    let _ = cx.update_window(handle, |_, window, cx| {
+                        owner.update(cx, |view, cx| view.open_save_path_dialog(window, cx))
+                    });
+                    return;
+                }
                 let result = match selected {
-                    Ok(Ok(Some(path))) => {
+                    Ok(Ok(Some(mut path))) => {
+                        let added_extension =
+                            path.extension().is_none() && path.file_name().is_some();
+                        if added_extension {
+                            path.set_extension(format.extension());
+                        }
                         let _ = owner.update(cx, |view, cx| {
                             view.work = Some(Work::Saving);
                             cx.notify();
@@ -3045,29 +3267,17 @@ impl GraphDocumentView {
                         let work = ticket.clone();
                         background
                             .spawn(async move {
-                                format.validate_save_path(&path)?;
-                                let canonical_target = std::fs::canonicalize(&path).ok();
-                                if open_paths.iter().any(|open| {
-                                    open == &path
-                                        || canonical_target.as_ref().is_some_and(|target| {
-                                            std::fs::canonicalize(open)
-                                                .is_ok_and(|open| open == *target)
-                                        })
-                                }) {
-                                    return Err(
-                                        "That file is already open in another document.".into()
-                                    );
-                                }
-                                if let Some(source) = source
-                                    && std::fs::canonicalize(&source)
-                                        .ok()
-                                        .zip(std::fs::canonicalize(&path).ok())
-                                        .is_some_and(|(source, target)| source == target)
-                                {
-                                    return Err(
-                                        "Choose a different filename to preserve the imported GTX."
-                                            .into(),
-                                    );
+                                Self::validate_save_destination(
+                                    &path,
+                                    format,
+                                    &open_paths,
+                                    source.as_deref(),
+                                )?;
+                                if added_extension && path.try_exists().map_err(model::failure)? {
+                                    return Err(format!(
+                                        "Choose the existing .{} file to confirm replacing it.",
+                                        format.extension()
+                                    ));
                                 }
                                 if let Some(writer) = source_bytes {
                                     model::save_bytes(writer.bytes(), path, &work)
@@ -3104,6 +3314,7 @@ impl GraphDocumentView {
         }
         self.work = None;
         self.ticket = None;
+        self.save_fallback_path = None;
         match result {
             Ok(Some(path)) => {
                 if self.workspace.is_some()
@@ -3188,6 +3399,7 @@ fn node_catalog_choices(
 const STANDALONE_NODES: &[&str] = &[
     "Solid Color",
     "Oklab Color",
+    "Checkerboard",
     "Gradient",
     "Noise",
     "Cells",
@@ -3289,30 +3501,87 @@ const NODES_WITH_INPUTS: &[&str] = &[
     "Remap",
     "Rotate & Tile",
 ];
+impl GraphDocumentView {
+    fn render_checkerboard_colors(
+        &self,
+        colors: [mycela_engine::PointwiseParameter<ForegroundError>; 2],
+        mut channels: [Vec<Field>; 2],
+        busy: bool,
+        cx: &Context<Self>,
+    ) -> Field {
+        let open = self.inspector.checkerboard_color_open;
+        let theme = cx.theme();
+        let buttons = colors.into_iter().enumerate().map(|(index, property)| {
+            let (id, label) = [
+                ("checkerboard-color-1", "Color 1"),
+                ("checkerboard-color-2", "Color 2"),
+            ][index];
+            let swatch = property
+                .effective_color_at(self.sample_time)
+                .or_else(|_| property.color())
+                .ok()
+                .map(|color| {
+                    let [r, g, b] = color.components().map(|value| value.clamp(0., 1.) as f32);
+                    Rgba { r, g, b, a: 1. }.into()
+                })
+                .unwrap_or(theme.background);
+            Button::new(id)
+                .label(label)
+                .icon(if open == Some(index) {
+                    gpui_kit::component::IconName::ChevronUp
+                } else {
+                    gpui_kit::component::IconName::ChevronDown
+                })
+                .small()
+                .flex_1()
+                .selected(open == Some(index))
+                .disabled(busy)
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    let open = &mut view.inspector.checkerboard_color_open;
+                    *open = (*open != Some(index)).then_some(index);
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .h_4()
+                        .w_5()
+                        .flex_shrink_0()
+                        .rounded_sm()
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(swatch),
+                )
+        });
+        Field::new().child(
+            div()
+                .v_flex()
+                .gap_2()
+                .child(div().h_flex().gap_2().children(buttons))
+                .when_some(open, |body, color| {
+                    body.child(Form::new().children(std::mem::take(&mut channels[color])))
+                }),
+        )
+    }
+}
+
 impl Render for GraphDocumentView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.is_busy();
         let owner = cx.weak_entity();
-        let save_owner = owner.clone();
         let theme = cx.theme().clone();
-        let name = self
-            .path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .or_else(|| {
-                self.imported_from
-                    .as_ref()
-                    .and_then(|path| path.file_stem())
-                    .map(|name| format!("{} · Imported GTX", name.to_string_lossy()))
-            })
-            .unwrap_or_else(|| "Untitled".into());
+        let name = self.document_name();
+        let imported = self.path.is_none() && self.imported_from.is_some();
         let source_property = self.source_animation;
         let source_animation = source_property.is_some();
         let embedded_noise = self.embedded_noise.is_some();
         let embedded_environment = self.embedded_environment.is_some();
         let property_editor = embedded_noise || embedded_environment;
         let graph_tools = !source_animation && !property_editor;
+        let save_location = self
+            .path
+            .as_ref()
+            .filter(|_| graph_tools)
+            .map(|path| path.display().to_string());
         let results_visible = graph_tools && self.results.is_visible();
         let title = if embedded_environment {
             "Edit environment map".into()
@@ -3321,7 +3590,9 @@ impl Render for GraphDocumentView {
         } else if source_animation {
             "Solid Color animation".into()
         } else {
-            format!("{name}{}", if self.is_dirty() { " · Modified" } else { "" })
+            let source = if imported { " · Imported GTX" } else { "" };
+            let changed = if self.is_dirty() { " · Modified" } else { "" };
+            format!("{name}{source}{changed}")
         };
         let history_draft = self.has_field_drafts(cx);
         let can_undo = !busy && !history_draft && self.history_available(HistoryDirection::Undo);
@@ -3338,11 +3609,56 @@ impl Render for GraphDocumentView {
             })
             .child(
                 div()
+                    .v_flex()
                     .flex_1()
                     .min_w_0()
-                    .truncate()
-                    .font_semibold()
-                    .child(title),
+                    .when_else(
+                        graph_tools && self.workspace.is_some(),
+                        |heading| {
+                            heading.child(
+                                div().h_flex().min_w_0().child(
+                                    Button::new("graph-document-name")
+                                        .ghost()
+                                        .xsmall()
+                                        .px_0()
+                                        .max_w_full()
+                                        .tab_index(0)
+                                        .disabled(busy)
+                                        .accessibility_label(title.clone())
+                                        .tooltip("Double-click to rename document")
+                                        .child(
+                                            div().truncate().font_semibold().child(title.clone()),
+                                        )
+                                        .on_click(cx.listener(
+                                            |view, event: &gpui_kit::ClickEvent, window, cx| {
+                                                if event.click_count() == 2 || event.is_keyboard() {
+                                                    view.open_rename_document(window, cx);
+                                                }
+                                            },
+                                        )),
+                                ),
+                            )
+                        },
+                        |heading| {
+                            heading.child(div().truncate().font_semibold().child(title.clone()))
+                        },
+                    )
+                    .when_some(save_location, |header, path| {
+                        let tooltip = path.clone();
+                        header.child(
+                            div()
+                                .id("graph-save-location")
+                                .test_support()
+                                .truncate()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .tooltip(move |window, cx| {
+                                    gpui_kit::component::tooltip::Tooltip::new(tooltip.clone())
+                                        .build(window, cx)
+                                })
+                                .child(path),
+                        )
+                    }),
             )
             .when(
                 graph_tools && !results_visible && !self.overview_open,
@@ -3398,30 +3714,24 @@ impl Render for GraphDocumentView {
                         Button::new("graph-save-as")
                             .small()
                             .ghost()
-                            .icon(gpui_kit::assets::IconName::SaveAll)
-                            .tooltip("Save as")
-                            .accessibility_label("Save as")
+                            .label("Save As…")
                             .disabled(busy)
-                            .dropdown_menu(move |menu, _, _| {
-                                let project = save_owner.clone();
-                                let gtx = save_owner.clone();
-                                menu.item(PopupMenuItem::new("Mycela project…").on_click(
-                                    move |_, _, cx| {
-                                        let _ = project.update(cx, |view, cx| view.save(true, cx));
-                                    },
-                                ))
-                                .item(
-                                    PopupMenuItem::new("Genetica GTX…").on_click(
-                                        move |_, window, cx| {
-                                            let _ = gtx.update(cx, |view, cx| {
-                                                view.save_gtx_copy(window, cx)
-                                            });
-                                        },
-                                    ),
-                                )
-                            }),
+                            .on_click(cx.listener(|view, _, _, cx| view.save(true, cx))),
                     )
             })
+            .when(
+                self.work == Some(Work::ChoosingSave) && self.save_fallback_path.is_some(),
+                |toolbar| {
+                    toolbar.child(
+                        Button::new("graph-save-enter-path")
+                            .small()
+                            .label("Enter path…")
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.open_save_path_dialog(window, cx);
+                            })),
+                    )
+                },
+            )
             .when(self.history().is_some(), |toolbar| {
                 toolbar
                     .child(
@@ -3533,38 +3843,50 @@ impl Render for GraphDocumentView {
                         .on_click(cx.listener(|view, _, _, cx| view.cancel_export(cx))),
                 )
             });
-        let navigation =
-            div()
-                .v_flex()
-                .size_full()
-                .min_h_0()
-                .child(
-                    div()
-                        .h_flex()
-                        .p_3()
-                        .gap_2()
-                        .child(div().flex_1().font_semibold().child("Graph"))
-                        .child(
-                            Button::new("graph-focus-tree")
-                                .small()
-                                .ghost()
-                                .label("Select node")
-                                .disabled(busy)
-                                .on_click(cx.listener(|view, _, window, cx| {
-                                    view.canvas.visible = false;
-                                    view.tree.update(cx, |tree, cx| tree.focus(window, cx));
-                                    cx.notify();
-                                })),
-                        ),
-                )
-                .child(div().flex_1().min_h_0().child(Tree::new(
-                    &self.tree,
-                    |_, entry, _, _, _| {
+        let navigation = div()
+            .v_flex()
+            .size_full()
+            .min_h_0()
+            .child(
+                div()
+                    .h_flex()
+                    .p_3()
+                    .gap_2()
+                    .child(div().flex_1().font_semibold().child("Graph"))
+                    .child(
+                        Button::new("graph-focus-tree")
+                            .small()
+                            .ghost()
+                            .label("Select node")
+                            .disabled(busy)
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.canvas.visible = false;
+                                view.tree.update(cx, |tree, cx| tree.focus(window, cx));
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                div().flex_1().min_h_0().child(
+                    Tree::new(&self.tree, |_, entry, _, _, _| {
                         ListItem::new(entry.item().id.clone())
                             .accessibility_label(entry.item().label.clone())
                             .child(div().truncate().child(entry.item().label.clone()))
-                    },
-                )));
+                    })
+                    .context_menu({
+                        let owner = owner.clone();
+                        move |_, entry, menu, window, cx| {
+                            Self::build_node_commands(
+                                menu,
+                                &owner,
+                                entry.item().id.as_ref(),
+                                window,
+                                cx,
+                            )
+                        }
+                    }),
+                ),
+            );
         let mut form = Form::new();
         if let Some(levels) = &self.inspector.levels {
             form = form.child(Field::new().child(levels.clone()));
@@ -3592,6 +3914,15 @@ impl Render for GraphDocumentView {
         if let Some(gradient) = &self.inspector.mask_gradient {
             form = form.child(Field::new().child(self.render_graph_gradient(gradient, busy, cx)));
         }
+        let checkerboard_colors = self
+            .inspector
+            .owner
+            .as_ref()
+            .and_then(Node::filter)
+            .filter(|filter| filter.kind() == mycela_engine::PointwiseKind::Checkerboard)
+            .and_then(|filter| Some([filter.parameter(0).ok()?, filter.parameter(1).ok()?]));
+        let mut checkerboard_channels = [Vec::new(), Vec::new()];
+        let history = self.history();
         for draft in self.inspector.drafts.iter().filter(|draft| {
             (!source_animation || !draft.is_stored_solid_value())
                 && !draft.is_animation()
@@ -3620,44 +3951,58 @@ impl Render for GraphDocumentView {
                 || environment.is_some_and(|(panel, receiver)| {
                     panel.value().numeric_adjuster_key(receiver).is_some()
                 });
-            let inline = environment_menu.is_some();
-            let input = Input::new(&draft.input)
-                .id(draft.id.clone())
-                .disabled(
+            let input = draft
+                .control(
                     busy || linked
                         || draft.is_layer_controlled()
                         || draft.is_controlled_selector_color(),
                 )
-                .aria_label(draft.label.clone());
-            form = form.child(
-                Field::new()
-                    .label(if draft.is_stored_solid_value() {
-                        format!("{} (0–255)", draft.label)
-                    } else {
-                        draft.label.clone()
-                    })
-                    .child(
+                .history(history.clone());
+            let checkerboard_channel =
+                draft.filter_color_component().and_then(|(property, axis)| {
+                    let index = checkerboard_colors
+                        .as_ref()?
+                        .iter()
+                        .position(|color| color.same_reference(property))?;
+                    Some((index, axis))
+                });
+            let field = Field::new()
+                .label(if let Some((_, axis)) = checkerboard_channel {
+                    ["Red", "Green", "Blue"][axis].to_owned()
+                } else if draft.is_stored_solid_value() {
+                    format!("{} (0–255)", draft.label)
+                } else {
+                    draft.label.clone()
+                })
+                .child(
+                    div()
+                        .v_flex()
+                        .gap_1()
+                        .child(input)
+                        .when_some(controls, |row, controls| row.child(controls.buttons))
+                        .when_some(environment_menu, |row, menu| row.child(menu)),
+                )
+                .when_some(draft.live_error.clone(), |field, error| {
+                    field.description_fn(move |_, cx| {
                         div()
-                            .gap_1()
-                            .when(inline, |row| row.h_flex().items_center())
-                            .when(!inline, |row| row.v_flex())
-                            .child(
-                                div()
-                                    .when(inline, |row| row.flex_1().min_w_0())
-                                    .child(input),
-                            )
-                            .when_some(controls, |row, controls| row.child(controls.buttons))
-                            .when_some(environment_menu, |row, menu| row.child(menu)),
-                    )
-                    .when_some(draft.live_error.clone(), |field, error| {
-                        field.description_fn(move |_, cx| {
-                            div()
-                                .text_sm()
-                                .text_color(cx.theme().danger)
-                                .child(error.clone())
-                        })
-                    }),
-            );
+                            .text_sm()
+                            .text_color(cx.theme().danger)
+                            .child(error.clone())
+                    })
+                });
+            if let Some((color, _)) = checkerboard_channel {
+                checkerboard_channels[color].push(field);
+            } else {
+                form = form.child(field);
+            }
+        }
+        if let Some(colors) = checkerboard_colors {
+            form = form.child(self.render_checkerboard_colors(
+                colors,
+                checkerboard_channels,
+                busy,
+                cx,
+            ));
         }
         if let Some(gradient) = &self.inspector.gradient
             && !gradient.is_animation_palette()
@@ -3901,12 +4246,7 @@ impl Render for GraphDocumentView {
                                     (false, 0) => "Start output",
                                     (false, _) => "End output",
                                 })
-                                .child(
-                                    Input::new(&draft.input)
-                                        .id(draft.id.clone())
-                                        .disabled(busy)
-                                        .aria_label(draft.label.clone()),
-                                ),
+                                .child(draft.control(busy)),
                         );
                     }
                 }
@@ -3958,12 +4298,9 @@ impl Render for GraphDocumentView {
                         .filter(|draft| draft.is_animation_palette())
                     {
                         stops = stops.child(
-                            Field::new().label(draft.label.clone()).child(
-                                Input::new(&draft.input)
-                                    .id(draft.id.clone())
-                                    .aria_label(draft.label.clone())
-                                    .disabled(busy),
-                            ),
+                            Field::new()
+                                .label(draft.label.clone())
+                                .child(draft.control(busy)),
                         );
                     }
                     group = group
@@ -4010,12 +4347,9 @@ impl Render for GraphDocumentView {
             let mut fields = Form::new();
             for draft in binding_drafts {
                 fields = fields.child(
-                    Field::new().label(draft.label.clone()).child(
-                        Input::new(&draft.input)
-                            .id(draft.id.clone())
-                            .disabled(busy)
-                            .aria_label(draft.label.clone()),
-                    ),
+                    Field::new()
+                        .label(draft.label.clone())
+                        .child(draft.control(busy)),
                 );
             }
             Some(Collapsible::new().open(self.bindings_open)
@@ -4032,175 +4366,7 @@ impl Render for GraphDocumentView {
             .and_then(|key| self.navigation.label(key))
             .unwrap_or("Select a branch or input")
             .to_string();
-        let insert_owner = owner.clone();
-        let insert_selection = self.selection.clone();
-        let insert_node = self.inspector.owner.clone();
-        let insert_revision = self.revision;
-        let insertion = Button::new("graph-replace-node")
-            .small()
-            .label(if self.selected_node().is_some() {
-                "Replace node…"
-            } else {
-                "Add node…"
-            })
-            .disabled(busy || self.selection.is_none())
-            .dropdown_menu(move |menu, _, _| {
-                let owner = insert_owner.clone();
-                let selection = insert_selection.clone();
-                let node = insert_node.clone();
-                node_catalog(menu, move |identity, window, cx| {
-                    let _ = owner.update(cx, |view, cx| {
-                        if view.is_original_selection(&selection, &node, insert_revision) {
-                            view.replace(Some(identity), window, cx);
-                        }
-                    });
-                })
-            });
-        let can_add_contents = self
-            .selected_node()
-            .and_then(|node| node.kind())
-            .is_some_and(|kind| {
-                matches!(
-                    kind,
-                    mycela_engine::PointwiseKind::Group
-                        | mycela_engine::PointwiseKind::WizardGroup
-                        | mycela_engine::PointwiseKind::MapVariable
-                )
-            });
-        let can_remove_contents = self
-            .selection
-            .as_deref()
-            .and_then(|key| self.navigation.target(key))
-            .and_then(|target| match target {
-                Target::Slot(slot) => Some(slot),
-                _ => None,
-            })
-            .is_some_and(|slot| {
-                let parent = slot.parent();
-                matches!(
-                    parent.kind(),
-                    Some(
-                        mycela_engine::PointwiseKind::Group
-                            | mycela_engine::PointwiseKind::WizardGroup
-                            | mycela_engine::PointwiseKind::MapVariable
-                    )
-                ) && parent
-                    .contents()
-                    .iter()
-                    .skip(1)
-                    .any(|item| item.same_reference(&slot))
-            });
-        let remove_contents_selection = self.selection.clone();
-        let remove_contents_node = self.inspector.owner.clone();
-        let remove_contents_revision = self.revision;
-        let add_contents_selection = self.selection.clone();
-        let add_contents_node = self.inspector.owner.clone();
-        let add_contents_revision = self.revision;
-        let delete_selection = self.selection.clone();
-        let delete_node = self.selected_node().filter(|node| !node.is_default_input());
-        let delete_revision = self.revision;
-        let can_group_branch = self.selection.is_some()
-            && self
-                .selected_node()
-                .is_none_or(|node| !node.is_default_input());
-        let can_convert_lab = matches!(
-            self.selected_node().and_then(|node| node.kind()),
-            Some(mycela_engine::PointwiseKind::TemplateLab(_))
-        );
         let lab_material_editor = self.lab_material_editor_open();
-        let compact_synthesis = self.compact_synthesis_inspector(window);
-        let mut graph_actions = (graph_tools && !lab_material_editor).then(|| {
-            div()
-                .h_flex()
-                .flex_wrap()
-                .gap_2()
-                .child(insertion)
-                .children(self.insert_below_picker(cx))
-                .when(can_group_branch, |row| {
-                    row.child(
-                        Button::new("graph-group-branch")
-                            .small()
-                            .label("Group branch")
-                            .disabled(busy)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.group_selected_branch(window, cx);
-                            })),
-                    )
-                })
-                .when(can_convert_lab, |row| {
-                    row.child(
-                        Button::new("graph-convert-lab")
-                            .small()
-                            .label("Convert Lab to Basic Nodes")
-                            .disabled(busy)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.convert_selected_lab(window, cx);
-                            })),
-                    )
-                })
-                .child(self.connection_picker(cx))
-                .children(self.share_output_picker(cx))
-                .children(self.group_input_picker(cx))
-                .when(can_add_contents, |row| {
-                    row.child(
-                        Button::new("graph-add-contents")
-                            .small()
-                            .label("Add contents branch")
-                            .disabled(busy)
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                if view.is_original_selection(
-                                    &add_contents_selection,
-                                    &add_contents_node,
-                                    add_contents_revision,
-                                ) {
-                                    view.add_group_contents(window, cx);
-                                }
-                            })),
-                    )
-                })
-                .when(can_remove_contents, |row| {
-                    row.child(
-                        Button::new("graph-remove-contents")
-                            .small()
-                            .label("Remove contents branch")
-                            .disabled(busy)
-                            .on_click(cx.listener(move |view, _, window, cx| {
-                                if view.is_original_selection(
-                                    &remove_contents_selection,
-                                    &remove_contents_node,
-                                    remove_contents_revision,
-                                ) {
-                                    view.remove_group_contents(window, cx);
-                                }
-                            })),
-                    )
-                })
-                .child(
-                    Button::new("graph-delete-current")
-                        .small()
-                        .label("Delete Current")
-                        .tooltip("Remove this node and keep its first connected input")
-                        .disabled(busy || delete_node.is_none())
-                        .on_click(cx.listener(move |view, _, window, cx| {
-                            if view.is_original_selection(
-                                &delete_selection,
-                                &delete_node,
-                                delete_revision,
-                            ) {
-                                view.delete_current(window, cx);
-                            }
-                        })),
-                )
-                .child(
-                    Button::new("graph-clear-node")
-                        .small()
-                        .label("Clear input")
-                        .disabled(busy || self.selected_node().is_none())
-                        .on_click(
-                            cx.listener(|view, _, window, cx| view.replace(None, window, cx)),
-                        ),
-                )
-        });
         let inspector = div()
             .v_flex()
             .size_full()
@@ -4214,53 +4380,54 @@ impl Render for GraphDocumentView {
                     .border_color(theme.border)
                     .children(self.render_lab_material_heading())
                     .map(|heading| {
-                    if lab_material_editor {
-                        return heading;
-                    }
-                    heading
-                    .when_some(source_property, |heading, property| {
-                        heading.child(
-                            TabBar::new("solid-animation-properties")
-                                .selected_index(usize::from(
-                                    property == SolidColorProperty::Transparency,
-                                ))
-                                .child(Tab::new().label("Color").disabled(busy || history_draft))
-                                .child(
-                                    Tab::new()
-                                        .label("Transparency")
-                                        .disabled(busy || history_draft),
-                                )
-                                .on_click(cx.listener(|view, index, _, cx| {
-                                    if view.is_busy() || view.has_field_drafts(cx) {
-                                        return;
-                                    }
-                                    let next = Some(if *index == 0 {
-                                        SolidColorProperty::Color
-                                    } else {
-                                        SolidColorProperty::Transparency
-                                    });
-                                    if view.source_animation == next {
-                                        return;
-                                    }
-                                    view.source_animation = next;
-                                    view.curve_plot_drag = None;
-                            view.inspector.close_layer();
-                                    view.observe_drafts(cx);
-                                    cx.notify();
-                                })),
-                        )
-                    })
-                    .when(embedded_noise, |heading| heading.child(div().font_semibold().child("Lab controls")))
-                    .when(graph_tools, |heading| {
+                        if lab_material_editor {
+                            return heading;
+                        }
                         heading
-                            .child(div().font_semibold().child("Properties"))
-                            .child(div().text_sm().child(label))
-                            .children(if compact_synthesis {
-                                None
-                            } else {
-                                graph_actions.take()
+                            .when_some(source_property, |heading, property| {
+                                heading.child(
+                                    TabBar::new("solid-animation-properties")
+                                        .selected_index(usize::from(
+                                            property == SolidColorProperty::Transparency,
+                                        ))
+                                        .child(
+                                            Tab::new()
+                                                .label("Color")
+                                                .disabled(busy || history_draft),
+                                        )
+                                        .child(
+                                            Tab::new()
+                                                .label("Transparency")
+                                                .disabled(busy || history_draft),
+                                        )
+                                        .on_click(cx.listener(|view, index, _, cx| {
+                                            if view.is_busy() || view.has_field_drafts(cx) {
+                                                return;
+                                            }
+                                            let next = Some(if *index == 0 {
+                                                SolidColorProperty::Color
+                                            } else {
+                                                SolidColorProperty::Transparency
+                                            });
+                                            if view.source_animation == next {
+                                                return;
+                                            }
+                                            view.source_animation = next;
+                                            view.curve_plot_drag = None;
+                                            view.inspector.close_layer();
+                                            view.observe_drafts(cx);
+                                            cx.notify();
+                                        })),
+                                )
                             })
-                    })
+                            .when(embedded_noise, |heading| {
+                                heading.child(div().font_semibold().child("Lab controls"))
+                            })
+                            .when(graph_tools, |heading| {
+                                heading
+                                    .child(div().font_semibold().child("Properties"))
+                                    .child(div().text_sm().child(label))
+                            })
                     }),
             )
             .child(
@@ -4270,97 +4437,167 @@ impl Render for GraphDocumentView {
                     .min_h_0()
                     .child(
                         div()
-                            .id(if lab_material_editor { "graph-lab-material-scroll" } else { "graph-inspector-scroll" })
+                            .id(if lab_material_editor {
+                                "graph-lab-material-scroll"
+                            } else {
+                                "graph-inspector-scroll"
+                            })
                             .size_full()
                             .overflow_y_scroll()
                             .track_scroll(&self.inspector_scroll)
                             .lock_scroll_axis()
                             .test_support()
-                            .child(
-                        div()
-                            .p_4()
-                            .v_flex()
-                            .gap_3()
-                            .children(graph_actions)
-                            .map(|content| {
-                            if lab_material_editor {
-                                return content.children(self.render_synthesis_panel(busy, window, cx));
-                            }
-                            content
-                            .when_some(self.render_mesh_import(busy, cx), |content, picker| content.child(picker))
-                            .when_some(self.canvas_shape_picker(false, busy, cx), |content, shape| {
-                                content.child(div().h_flex().flex_wrap().gap_2().child(shape)
-                                    .children(self.canvas_shape_picker(true, busy, cx)))
-                            })
-                            .when(self.selected_node().is_some_and(|node| node.kind() == Some(mycela_engine::PointwiseKind::WizardGroup)), |content| {
-                                content.child(Button::new("graph-add-environment-variable")
-                                    .label("Add Environment variable")
-                                    .small()
-                                    .disabled(busy)
-                                    .on_click(cx.listener(|view, _, window, cx| view.add_wizard_environment_variable(window, cx))))
-                            })
-                            .when(!source_animation && !embedded_environment, |content| content.child(
-                                div().h_flex().flex_wrap().gap_2()
-                                    .children(self.lab_adjuster_menu(busy, cx))
-                                    .child(Button::new("graph-lab-presets")
-                                        .small()
-                                        .ghost()
-                                        .label("Lab presets…")
-                                        .disabled(busy)
-                                        .on_click(cx.listener(|view, _, window, cx| {
-                                            view.open_lab_presets(window, cx);
-                                        }))
+                            .child(div().p_4().v_flex().gap_3().map(|content| {
+                                if lab_material_editor {
+                                    return content
+                                        .children(self.render_synthesis_panel(busy, window, cx));
+                                }
+                                content
+                                    .when_some(
+                                        self.render_mesh_import(busy, cx),
+                                        |content, picker| content.child(picker),
                                     )
-                            ))
-                            .when_some(self.inspector.environment.as_ref().filter(|panel| !panel.is_style()), |content, panel| {
-                                content.child(self.render_environment_controls(panel, busy, cx))
-                            })
-                            .children(self.render_shader_controls(busy, cx))
-                            .children(self.render_region_picker(busy, cx))
-                            .children(self.render_canvas_layer_controls(busy, cx))
-                            .children(self.render_style_panel(busy, cx))
-                            .when_some(self.inspector.environment.as_ref().filter(|panel| panel.is_style()), |content, panel| {
-                                let style_pending = self.style.as_ref().is_some_and(|panel| panel.pending(cx));
-                                content.child(self.render_environment_controls(panel, busy || style_pending, cx))
-                            })
-                            .children(self.render_synthesis_panel(busy, window, cx))
-                            .child(form)
-                            .children(self.render_canvas_shape_panel(busy, cx))
-                            .when(!self.style.as_ref().is_some_and(style::Panel::canvas_expanded), |content| {
-                                content.children(self.canvas_area_panel(busy, cx))
-                            })
-                            .when_some(binding_section, |this, section| this.child(section))
-                            .when_some(animation_section, |this, section| this.child(section))
-                            .children(self.inspector.notes.iter().map(|note| {
-                                div()
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child(note.clone())
-                            }))
-                            }),
-                            ),
+                                    .when_some(
+                                        self.canvas_shape_picker(false, busy, cx),
+                                        |content, shape| {
+                                            content.child(
+                                                div()
+                                                    .h_flex()
+                                                    .flex_wrap()
+                                                    .gap_2()
+                                                    .child(shape)
+                                                    .children(
+                                                        self.canvas_shape_picker(true, busy, cx),
+                                                    ),
+                                            )
+                                        },
+                                    )
+                                    .when(
+                                        self.selected_node().is_some_and(|node| {
+                                            node.kind()
+                                                == Some(mycela_engine::PointwiseKind::WizardGroup)
+                                        }),
+                                        |content| {
+                                            content.child(
+                                                Button::new("graph-add-environment-variable")
+                                                    .label("Add Environment variable")
+                                                    .small()
+                                                    .disabled(busy)
+                                                    .on_click(cx.listener(
+                                                        |view, _, window, cx| {
+                                                            view.add_wizard_environment_variable(
+                                                                window, cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            )
+                                        },
+                                    )
+                                    .when(!source_animation && !embedded_environment, |content| {
+                                        content.child(
+                                            div()
+                                                .h_flex()
+                                                .flex_wrap()
+                                                .gap_2()
+                                                .children(self.lab_adjuster_menu(busy, cx))
+                                                .child(
+                                                    Button::new("graph-lab-presets")
+                                                        .small()
+                                                        .ghost()
+                                                        .label("Lab presets…")
+                                                        .disabled(busy)
+                                                        .on_click(cx.listener(
+                                                            |view, _, window, cx| {
+                                                                view.open_lab_presets(window, cx);
+                                                            },
+                                                        )),
+                                                ),
+                                        )
+                                    })
+                                    .when_some(
+                                        self.inspector
+                                            .environment
+                                            .as_ref()
+                                            .filter(|panel| !panel.is_style()),
+                                        |content, panel| {
+                                            content.child(
+                                                self.render_environment_controls(panel, busy, cx),
+                                            )
+                                        },
+                                    )
+                                    .children(self.render_shader_controls(busy, cx))
+                                    .children(self.render_region_picker(busy, cx))
+                                    .children(self.render_canvas_layer_controls(busy, cx))
+                                    .children(self.render_style_panel(busy, cx))
+                                    .when_some(
+                                        self.inspector
+                                            .environment
+                                            .as_ref()
+                                            .filter(|panel| panel.is_style()),
+                                        |content, panel| {
+                                            let style_pending = self
+                                                .style
+                                                .as_ref()
+                                                .is_some_and(|panel| panel.pending(cx));
+                                            content.child(self.render_environment_controls(
+                                                panel,
+                                                busy || style_pending,
+                                                cx,
+                                            ))
+                                        },
+                                    )
+                                    .children(self.render_synthesis_panel(busy, window, cx))
+                                    .child(form)
+                                    .children(self.render_canvas_shape_panel(busy, cx))
+                                    .when(
+                                        !self
+                                            .style
+                                            .as_ref()
+                                            .is_some_and(style::Panel::canvas_expanded),
+                                        |content| {
+                                            content.children(self.canvas_area_panel(busy, cx))
+                                        },
+                                    )
+                                    .when_some(binding_section, |this, section| this.child(section))
+                                    .when_some(animation_section, |this, section| {
+                                        this.child(section)
+                                    })
+                                    .children(self.inspector.notes.iter().map(|note| {
+                                        div()
+                                            .text_sm()
+                                            .text_color(theme.muted_foreground)
+                                            .child(note.clone())
+                                    }))
+                            })),
                     )
                     .vertical_scrollbar(&self.inspector_scroll),
             )
             .when(
                 (self.error.is_some() && self.has_field_drafts(cx))
-                    || self.inspector.drafts.iter().any(|draft| draft.live_error.is_some()),
-                |panel| panel.child(
-                div()
-                    .h_flex()
-                    .gap_2()
-                    .p_3()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(
-                        Button::new("graph-revert")
-                            .label("Reset field text")
-                            .disabled(busy)
-                            .on_click(cx.listener(|view, _, window, cx| {
-                                view.revert_fields(window, cx);
-                            })),
-                    ),
-            ))
+                    || self
+                        .inspector
+                        .drafts
+                        .iter()
+                        .any(|draft| draft.live_error.is_some()),
+                |panel| {
+                    panel.child(
+                        div()
+                            .h_flex()
+                            .gap_2()
+                            .p_3()
+                            .border_t_1()
+                            .border_color(theme.border)
+                            .child(
+                                Button::new("graph-revert")
+                                    .label("Reset field text")
+                                    .disabled(busy)
+                                    .on_click(cx.listener(|view, _, window, cx| {
+                                        view.revert_fields(window, cx);
+                                    })),
+                            ),
+                    )
+                },
+            )
             .children(self.render_shared_material_footer(busy, cx));
         let preview_status = if self.draft_preview_pending() {
             "Rendering…".to_owned()
@@ -4393,6 +4630,7 @@ impl Render for GraphDocumentView {
             format!("{LIVE_PREVIEW_SIZE} × {LIVE_PREVIEW_SIZE} · selected node")
         };
         let time_disabled = busy || self.preview_animation_active();
+
         let (displayed, aspect) = self
             .environment_converter_raster(cx)
             .map(|(raster, aspect)| (Some(raster), aspect))
@@ -4686,6 +4924,14 @@ impl Render for GraphDocumentView {
             )
             .into_any_element()
         };
+        let rendering = matches!(
+            self.work,
+            Some(
+                Work::RenderingResult
+                    | Work::WritingEnvironmentOutput
+                    | Work::WritingSynthesisPreset
+            )
+        ) || self.work == Some(Work::Exporting) && !results_visible;
         let feedback = self
             .error
             .clone()
@@ -4708,6 +4954,7 @@ impl Render for GraphDocumentView {
                 Some(Work::ChoosingSave) => "Choose where to save the document".into(),
                 Some(Work::Saving) if source_animation => "Saving Solid Color source…".into(),
                 Some(Work::Saving) => "Saving current graph…".into(),
+                Some(Work::Renaming) => "Renaming document…".into(),
                 Some(Work::ChoosingExport) => "Choose where to save the image".into(),
                 Some(Work::Exporting) if results_visible => "Saving image…".into(),
                 Some(Work::Exporting) => "Rendering and saving image…".into(),
@@ -4763,6 +5010,11 @@ impl Render for GraphDocumentView {
             }))
             .on_action(cx.listener(|view, _: &SaveDocument, _, cx| view.save(false, cx)))
             .on_action(cx.listener(|view, _: &SaveDocumentAs, _, cx| view.save(true, cx)))
+            .when(graph_tools, |workspace| {
+                workspace.on_action(cx.listener(|view, _: &RenameDocument, window, cx| {
+                    view.open_rename_document(window, cx);
+                }))
+            })
             .on_action(cx.listener(|view, _: &UndoGraphEdit, window, cx| {
                 view.travel_history(HistoryDirection::Undo, window, cx)
             }))
@@ -4770,7 +5022,13 @@ impl Render for GraphDocumentView {
                 view.travel_history(HistoryDirection::Redo, window, cx)
             }))
             .when(graph_tools && !results_visible, |this| {
-                this.on_action(cx.listener(|view, _: &ExportGraphImage, window, cx| {
+                this.on_action(cx.listener(|view, _: &CopyNodeTree, _, cx| {
+                    view.copy_node_tree(cx);
+                }))
+                .on_action(cx.listener(|view, _: &PasteNodeTree, window, cx| {
+                    view.paste_node_tree(window, cx);
+                }))
+                .on_action(cx.listener(|view, _: &ExportGraphImage, window, cx| {
                     view.open_export_image(window, cx)
                 }))
                 .on_action(cx.listener(
@@ -4825,13 +5083,30 @@ impl Render for GraphDocumentView {
                     .test_support()
                     .role(gpui_kit::Role::Status)
                     .aria_label(feedback.clone())
+                    .h_flex()
+                    .gap_3()
+                    .items_center()
                     .px_3()
                     .py_2()
                     .border_t_1()
                     .border_color(theme.border)
                     .text_sm()
                     .when(self.error.is_some(), |this| this.text_color(theme.danger))
-                    .child(feedback),
+                    .child(feedback)
+                    .when(rendering, |row| {
+                        row.child(
+                            div()
+                                .id("graph-render-progress")
+                                .test_support()
+                                .w(rems(9.))
+                                .child(
+                                    Progress::new("render-progress")
+                                        .small()
+                                        .loading(true)
+                                        .accessibility_label("Render progress"),
+                                ),
+                        )
+                    }),
             )
     }
 }

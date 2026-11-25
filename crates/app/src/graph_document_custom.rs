@@ -2,12 +2,13 @@
 use super::super::inspector::LayerSelection;
 use super::{GraphDocumentView, animation::AnimationTarget};
 use crate::ForegroundError;
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use gpui_kit::base::{Disableable, StyledExt};
 use gpui_kit::component::{
     button::Button,
     checkbox::Checkbox,
     form::{Field, Form},
-    input::{Input, InputState},
+    input::InputState,
     menu::{DropdownMenu, PopupMenuItem},
 };
 use gpui_kit::{App, AppContext, Context, Entity, IntoElement, Window, div, prelude::*};
@@ -444,10 +445,20 @@ pub(crate) fn render_custom_points(
     content = content.child(Form::new().columns(2).children(
         ["X", "Y"].into_iter().enumerate().map(|(i, label)| {
             Field::new().label(label).child(
-                Input::new(&draft.fields[i])
-                    .id(format!("{id}-{}", label.to_lowercase()))
-                    .aria_label(format!("Point {label}"))
-                    .disabled(disabled),
+                NumericField::new(
+                    &draft.fields[i],
+                    format!("{id}-{}", label.to_lowercase()),
+                    format!("Point {label}"),
+                    NumericRange::bounds(
+                        if i == 0 {
+                            [0.0, 1.0]
+                        } else {
+                            [-1000.0, 1000.0]
+                        },
+                        0.001,
+                    ),
+                )
+                .disabled(disabled),
             )
         }),
     ));

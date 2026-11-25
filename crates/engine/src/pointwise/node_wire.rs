@@ -676,7 +676,12 @@ impl<E: 'static> PointwiseNode<E> {
         let kind = self.kind();
         if matches!(
             kind,
-            Some(PointwiseKind::OklabColor | PointwiseKind::MedianBlur | PointwiseKind::Shader)
+            Some(
+                PointwiseKind::OklabColor
+                    | PointwiseKind::MedianBlur
+                    | PointwiseKind::Shader
+                    | PointwiseKind::Checkerboard
+            )
         ) {
             issues.push("This node type is unavailable in Genetica.");
         }

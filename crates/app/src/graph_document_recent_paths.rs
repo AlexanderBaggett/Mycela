@@ -80,12 +80,31 @@ impl RecentPaths {
         format: DocumentFormat,
         cx: &mut App,
     ) -> Result<(), String> {
+        Self::record_document(path, format, None, cx)
+    }
+
+    pub(super) fn remember_renamed_document(
+        old: &Path,
+        path: &Path,
+        cx: &mut App,
+    ) -> Result<(), String> {
+        Self::record_document(path, DocumentFormat::Mycela, Some(old), cx)
+    }
+
+    fn record_document(
+        path: &Path,
+        format: DocumentFormat,
+        old: Option<&Path>,
+        cx: &mut App,
+    ) -> Result<(), String> {
         let parent = path
             .parent()
             .filter(|parent| parent.is_absolute() && path.file_name().is_some())
             .ok_or_else(|| "A recent document needs an absolute file path.".to_owned())?;
         Self::change(cx, |state| {
-            state.files.retain(|file| file.path != path);
+            state
+                .files
+                .retain(|file| file.path != path && Some(file.path.as_path()) != old);
             state.files.insert(
                 0,
                 RecentFile {

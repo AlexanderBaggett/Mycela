@@ -8,19 +8,23 @@ use crate::{
         preview_export::PreviewPixels,
     },
 };
-use gpui_kit::base::{Disableable, Selectable, StyledExt};
+use gpui_kit::base::{Disableable, Selectable, StyledExt, TestSupportExt};
 use gpui_kit::component::{
     ActiveTheme, Sizable, WindowExt,
-    button::{Button, ButtonVariants},
+    button::{Button, ButtonVariants, Toggle},
     dialog::{DialogAction, DialogClose, DialogFooter},
     menu::{DropdownMenu, PopupMenuItem},
 };
 use gpui_kit::{
-    App, AppContext, Context, IntoElement, ParentElement, RenderImage, Styled, Window, div, img,
-    prelude::*,
+    App, AppContext, Bounds, Context, IntoElement, ParentElement, Pixels, Point, RenderImage,
+    ScrollWheelEvent, Size, Styled, Window, canvas, div, prelude::*, px, size,
 };
 use mycela_engine::{PreviewBitmap, SharedImageMap};
-use std::{path::Path, sync::Arc};
+use std::{cell::Cell, path::Path, rc::Rc, sync::Arc};
+
+#[path = "graph_document_result_viewport.rs"]
+mod viewport;
+use viewport::{DenseTiles, Display, ZOOM_LEVELS, Zoom};
 
 const SLOT_COUNT: usize = 6;
 pub(super) const TEXTURE_OUTPUT_LABEL: &str = "Texture output";
@@ -31,6 +35,9 @@ pub(super) struct Results {
     selected: usize,
     visible: bool,
     available: bool,
+    display: Display,
+    viewport_bounds: Rc<Cell<Bounds<Pixels>>>,
+    dense_tiles: DenseTiles,
 }
 
 impl Results {
@@ -54,6 +61,7 @@ impl Results {
     fn commit(&mut self, slot: usize, frame: ResultFrame) {
         self.slots[slot] = Some(frame);
         self.selected = slot;
+        self.display.reset_position();
         self.visible = true;
         self.available = true;
     }
@@ -71,6 +79,15 @@ struct Projection {
     selection: PreviewSelection,
     bitmap: PreviewBitmap,
     raster: Arc<RenderImage>,
+}
+
+impl Projection {
+    fn native_size(&self) -> Size<Pixels> {
+        size(
+            px(self.bitmap.width() as f32),
+            px(self.bitmap.height() as f32),
+        )
+    }
 }
 
 impl ResultFrame {
@@ -141,12 +158,7 @@ impl GraphDocumentView {
     }
 
     fn result_source(&self, target: RenderTarget, node: &Node) -> String {
-        let document = self
-            .path
-            .as_ref()
-            .or(self.imported_from.as_ref())
-            .and_then(|path| path.file_name())
-            .map_or_else(|| "Untitled".into(), |name| name.to_string_lossy());
+        let document = self.document_name();
         let label = match target {
             RenderTarget::Texture => {
                 format!(
@@ -610,11 +622,27 @@ impl GraphDocumentView {
                             .selected(index == active)
                             .disabled(busy)
                             .on_click(cx.listener(move |view, _, _, cx| {
-                                view.results.selected = index;
-                                cx.notify();
+                                if view.results.selected != index {
+                                    view.results.selected = index;
+                                    view.results.display.reset_position();
+                                    cx.notify();
+                                }
                             }))
                     }))
                     .children(self.result_map_picker(current, active, busy, cx))
+                    .when(current.is_some(), |tools| {
+                        tools.child(self.result_zoom_menu(cx)).child(
+                            Toggle::new("graph-result-tile")
+                                .label("Tile image")
+                                .tooltip("Tile image")
+                                .small()
+                                .checked(self.results.display.tiled)
+                                .on_click(cx.listener(|view, tiled, _, cx| {
+                                    view.results.display.set_tiled(*tiled);
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .child(
                         Button::new("graph-export-result")
                             .small()
@@ -648,23 +676,102 @@ impl GraphDocumentView {
                     )),
             )
             .when_some(current, |view, frame| {
-                let geometry = frame.image.geometry();
-                let aspect = geometry.width() as f32 / geometry.height() as f32;
-                view.child(
-                    div()
-                        .relative()
-                        .flex_1()
-                        .min_h_0()
-                        .w_full()
-                        .child(crate::preview_background::checkerboard_for(aspect))
-                        .child(
-                            img(frame.projected.raster.clone())
-                                .absolute()
-                                .size_full()
-                                .object_fit(gpui_kit::ObjectFit::Contain),
-                        ),
-                )
+                view.child(self.result_viewport(frame, cx))
             })
+    }
+
+    fn change_result_zoom(
+        &mut self,
+        zoom: Zoom,
+        pivot: Option<Point<Pixels>>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(frame) = self.results.current() else {
+            return;
+        };
+        let native = frame.projected.native_size();
+        let area = self.results.viewport_bounds.get();
+        self.results
+            .display
+            .set_zoom(zoom, area, native, pivot.unwrap_or_else(|| area.center()));
+        cx.notify();
+    }
+
+    fn result_zoom_menu(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let owner = cx.weak_entity();
+        let current = self.results.display.zoom;
+        let label = format!("Zoom: {}", current.label());
+        Button::new("graph-result-zoom")
+            .small()
+            .tab_index(0)
+            .label(label.clone())
+            .accessibility_label(label)
+            .dropdown_menu(move |mut menu, _, _| {
+                for choice in
+                    std::iter::once(Zoom::Fit).chain((0..ZOOM_LEVELS.len()).map(Zoom::Level))
+                {
+                    let owner = owner.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(choice.label())
+                            .checked(choice == current)
+                            .on_click(move |_, _, cx| {
+                                let _ = owner.update(cx, |view, cx| {
+                                    view.change_result_zoom(choice, None, cx);
+                                });
+                            }),
+                    );
+                }
+                menu.scrollable(true)
+            })
+    }
+
+    fn result_viewport(&self, frame: &ResultFrame, cx: &Context<Self>) -> impl IntoElement + use<> {
+        let bounds = self.results.viewport_bounds.clone();
+        let dense = self.results.dense_tiles.clone();
+        let display = self.results.display;
+        let native = frame.projected.native_size();
+        let raster = frame.projected.raster.clone();
+        div()
+            .id("graph-result-viewport")
+            .test_support()
+            .relative()
+            .flex_1()
+            .min_h_0()
+            .w_full()
+            .overflow_hidden()
+            .on_scroll_wheel(cx.listener(move |view, event: &ScrollWheelEvent, _, cx| {
+                let vertical = event.delta.pixel_delta(px(1.)).y;
+                if vertical != px(0.) {
+                    let area = view.results.viewport_bounds.get();
+                    let next = view
+                        .results
+                        .display
+                        .zoom
+                        .step(area.size, native, vertical > px(0.));
+                    view.change_result_zoom(next, Some(event.position), cx);
+                    cx.stop_propagation();
+                }
+            }))
+            .child(
+                canvas(
+                    move |area, _, cx| {
+                        bounds.set(area);
+                        (cx.theme().background, cx.theme().muted)
+                    },
+                    move |area, (light, dark), window, _| {
+                        let tile = display.tile(area, native);
+                        let background = if display.tiled {
+                            area
+                        } else {
+                            tile.intersect(&area)
+                        };
+                        viewport::paint_checkerboard(background, window, light, dark);
+                        viewport::paint(area, tile, display.tiled, &raster, &dense, window);
+                    },
+                )
+                .absolute()
+                .size_full(),
+            )
     }
 
     fn result_map_picker(

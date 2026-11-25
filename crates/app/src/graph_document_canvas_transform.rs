@@ -1,5 +1,6 @@
 //! Numeric and immediate transforms of the active Canvas selection.
 use super::*;
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use gpui_kit::component::{
     WindowExt,
     dialog::{DialogAction, DialogClose, DialogFooter},
@@ -297,11 +298,14 @@ impl Render for ValueForm {
             .gap_2()
             .child(
                 Form::new().child(
-                    Field::new().label(self.prompt.label).child(
-                        Input::new(&self.input)
-                            .id(self.prompt.input_id)
-                            .aria_label(self.prompt.label),
-                    ),
+                    Field::new()
+                        .label(self.prompt.label)
+                        .child(NumericField::new(
+                            &self.input,
+                            self.prompt.input_id,
+                            self.prompt.label,
+                            NumericRange::bounds(self.prompt.bounds, 0.01),
+                        )),
                 ),
             )
             .when_some(self.error.as_ref(), |form, error| {

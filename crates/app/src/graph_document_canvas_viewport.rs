@@ -39,6 +39,13 @@ pub(super) struct GraphBounds {
 }
 
 impl GraphBounds {
+    pub(super) fn include(&mut self, [x, y]: [f32; 2], width: f32, height: f32) {
+        self.min[0] = self.min[0].min(x);
+        self.min[1] = self.min[1].min(y);
+        self.max[0] = self.max[0].max(x + width);
+        self.max[1] = self.max[1].max(y + height);
+    }
+
     pub(super) fn for_cards(cards: &[Card]) -> Self {
         let mut bounds = Self {
             min: [f32::INFINITY; 2],
@@ -46,10 +53,7 @@ impl GraphBounds {
         };
         for card in cards.iter().filter(|card| !card.hidden) {
             let ([x, y], width) = card.extent();
-            bounds.min[0] = bounds.min[0].min(x);
-            bounds.min[1] = bounds.min[1].min(y);
-            bounds.max[0] = bounds.max[0].max(x + width);
-            bounds.max[1] = bounds.max[1].max(y + card.height());
+            bounds.include([x, y], width, card.height());
         }
         if !bounds.min[0].is_finite() {
             return Self {
@@ -188,7 +192,9 @@ impl PanState {
 
 #[derive(Clone, Copy)]
 struct PanDrag {
+    button: MouseButton,
     start: Point<Pixels>,
+    world: [f32; 2],
     offset: Point<Pixels>,
     active: bool,
 }
@@ -269,12 +275,29 @@ impl GraphDocumentView {
     pub(super) fn begin_canvas_pan(
         &mut self,
         event: &MouseDownEvent,
-        _: &mut Window,
+        window: &mut Window,
         _: &mut Context<Self>,
     ) {
+        let offset = self.canvas.scroll.offset();
+        let cursor = event.position - self.canvas.scroll.bounds().origin;
+        let world = self
+            .canvas
+            .viewport(window.rem_size())
+            .world_point(cursor, offset);
+        if event.button == MouseButton::Right {
+            let [x, y] = world;
+            if self.canvas.visible_cards().any(|card| {
+                let [left, top] = card.body_position();
+                (left..=left + CARD_WIDTH).contains(&x) && (top..=top + CARD_WIDTH).contains(&y)
+            }) {
+                return;
+            }
+        }
         self.canvas.pan.drag = Some(PanDrag {
+            button: event.button,
             start: event.position,
-            offset: self.canvas.scroll.offset(),
+            world,
+            offset,
             active: false,
         });
     }
@@ -288,7 +311,7 @@ impl GraphDocumentView {
         let Some(mut drag) = self.canvas.pan.drag else {
             return;
         };
-        if event.pressed_button != Some(MouseButton::Right) {
+        if event.pressed_button != Some(drag.button) {
             self.canvas.pan.drag = None;
             if drag.active {
                 cx.notify();
@@ -308,18 +331,39 @@ impl GraphDocumentView {
             cx.notify();
         }
         cx.stop_propagation();
-        self.pan_canvas_to(drag.offset + delta, window, cx);
+        if drag.button == MouseButton::Middle {
+            // Add canvas room when the graph already fits or reaches the viewport edge.
+            let cursor = event.position - self.canvas.scroll.bounds().origin;
+            let viewport = Viewport::new(
+                &self.canvas.graph_bounds(),
+                self.canvas.viewport_size,
+                window.rem_size(),
+                self.canvas.zoom,
+            );
+            self.canvas.anchor_at(drag.world, cursor, viewport);
+            cx.notify();
+        } else {
+            self.pan_canvas_to(drag.offset + delta, window, cx);
+        }
     }
 
     pub(super) fn end_canvas_pan(
         &mut self,
-        _: &MouseUpEvent,
+        event: &MouseUpEvent,
         _: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.canvas.pan.drag.take().is_some_and(|drag| drag.active) {
-            cx.stop_propagation();
-            cx.notify();
+        if let Some(drag) = self
+            .canvas
+            .pan
+            .drag
+            .filter(|drag| drag.button == event.button)
+        {
+            self.canvas.pan.drag = None;
+            if drag.active {
+                cx.stop_propagation();
+                cx.notify();
+            }
         }
     }
 

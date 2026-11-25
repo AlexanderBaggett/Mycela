@@ -108,6 +108,9 @@ fn create_with_context<E: 'static>(
         // Mycela extension. This identity is outside the original registry.
         return Ok(PointwiseFilter::new(PointwiseKind::OklabColor)?.node());
     }
+    if equals(identity, PointwiseKind::Checkerboard.name()) {
+        return Ok(PointwiseFilter::new(PointwiseKind::Checkerboard)?.node());
+    }
     if context.is_mycela_project() && equals(identity, PointwiseKind::MedianBlur.name()) {
         return Ok(PointwiseFilter::new(PointwiseKind::MedianBlur)?.node());
     }

@@ -5,6 +5,7 @@ use crate::curve_modulation::{
     open_child_path, render_modulation_menu,
 };
 use crate::custom_curve_editor::{CustomAction, CustomDraft};
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use crate::tone_curve;
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::{AnyElement, rems};
@@ -302,10 +303,16 @@ impl MappingEditor {
                     field.label.clone()
                 };
                 Field::new().label(label).child(
-                    Input::new(&field.input)
-                        .id(format!("mapping-layer-control-{}", field.control.id()))
-                        .aria_label(field.label.clone())
-                        .disabled(modulated),
+                    NumericField::new(
+                        &field.input,
+                        format!("mapping-layer-control-{}", field.control.id()),
+                        field.label.clone(),
+                        field
+                            .control
+                            .bounds()
+                            .map(|bounds| NumericRange::bounds(bounds, 0.01)),
+                    )
+                    .disabled(modulated),
                 )
             }));
         div()
@@ -422,6 +429,7 @@ impl Render for MappingEditor {
             },
         );
         let [minimum, maximum] = &self.outputs;
+        let output_range = NumericRange::bounds(self.mode.bounds(), 0.01);
         div()
             .v_flex()
             .gap_3()
@@ -449,16 +457,26 @@ impl Render for MappingEditor {
             .child(
                 Form::new()
                     .columns(2)
-                    .child(super::super::numeric_adjusters::number_field(
-                        minimum,
-                        "mapping-output-min",
-                        "Minimum output",
-                    ))
-                    .child(super::super::numeric_adjusters::number_field(
-                        maximum,
-                        "mapping-output-max",
-                        "Maximum output",
-                    )),
+                    .child(
+                        Field::new()
+                            .label("Minimum output")
+                            .child(NumericField::new(
+                                minimum,
+                                "mapping-output-min",
+                                "Minimum output",
+                                output_range,
+                            )),
+                    )
+                    .child(
+                        Field::new()
+                            .label("Maximum output")
+                            .child(NumericField::new(
+                                maximum,
+                                "mapping-output-max",
+                                "Maximum output",
+                                output_range,
+                            )),
+                    ),
             )
             .child(menu)
             .when_some(self.layer.as_ref(), |form, fields| {

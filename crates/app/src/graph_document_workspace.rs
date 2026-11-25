@@ -7,7 +7,6 @@ mod tests;
 
 struct Document {
     view: Entity<GraphDocumentView>,
-    untitled_name: String,
     label: String,
     path: Option<PathBuf>,
     root: Option<u64>,
@@ -18,11 +17,7 @@ struct Document {
 impl Document {
     fn refresh(&mut self, view: &GraphDocumentView) -> bool {
         let path = view.path.as_ref().or(view.imported_from.as_ref()).cloned();
-        let name = path
-            .as_deref()
-            .and_then(Path::file_name)
-            .map(|name| name.to_string_lossy().into_owned())
-            .unwrap_or_else(|| self.untitled_name.clone());
+        let name = view.document_name();
         let label = if view.is_dirty() {
             format!("{name} *")
         } else {
@@ -110,13 +105,12 @@ impl DocumentWorkspace {
             view.ensure_history_binding();
             view
         });
-        self.add_document(view, "Untitled".into(), window, cx)
+        self.add_document(view, window, cx)
     }
 
     fn add_document(
         &mut self,
         view: Entity<GraphDocumentView>,
-        untitled_name: String,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> usize {
@@ -130,7 +124,6 @@ impl DocumentWorkspace {
         });
         let mut document = Document {
             view: view.clone(),
-            untitled_name,
             label: String::new(),
             path: None,
             root: None,
@@ -164,6 +157,7 @@ impl DocumentWorkspace {
         let replace_untitled = self.documents.len() == 1
             && current.path.is_none()
             && current.imported_from.is_none()
+            && current.draft_name == "Untitled"
             && !current.is_dirty()
             && !current.has_field_drafts(cx);
         let index = if replace_untitled {
@@ -254,6 +248,15 @@ impl DocumentWorkspace {
                     return;
                 };
                 let owner = cx.weak_entity();
+                let name = (1..=workspace.documents.len() + 1)
+                    .map(|number| format!("Untitled {number}"))
+                    .find(|name| {
+                        workspace
+                            .documents
+                            .iter()
+                            .all(|doc| doc.view.read(cx).draft_name != *name)
+                    })
+                    .expect("one available untitled name");
                 let copy = cx.new(|cx| {
                     let mut view = GraphDocumentView::with_document_in_workspace(
                         document,
@@ -266,6 +269,7 @@ impl DocumentWorkspace {
                     );
                     view.canvas.visible = true;
                     view.ensure_history_binding();
+                    view.draft_name = name;
                     view.dirty = true;
                     // The native copy retains the row order but assigns fresh occurrence IDs.
                     view.canvas
@@ -281,16 +285,7 @@ impl DocumentWorkspace {
                     }
                     view
                 });
-                let name = (1..=workspace.documents.len() + 1)
-                    .map(|number| format!("Untitled {number}"))
-                    .find(|name| {
-                        workspace
-                            .documents
-                            .iter()
-                            .all(|doc| doc.untitled_name != *name)
-                    })
-                    .expect("one available untitled name");
-                let index = workspace.add_document(copy, name, window, cx);
+                let index = workspace.add_document(copy, window, cx);
                 workspace.switch(index, window, cx);
             });
         })
@@ -602,9 +597,14 @@ impl DocumentWorkspace {
                                                 .child(document.label.clone()),
                                         ),
                                 )
-                                .on_click(move |_, window, cx| {
+                                .on_click(move |event, window, cx| {
                                     let _ = owner.update(cx, |workspace, cx| {
-                                        workspace.switch(index, window, cx)
+                                        workspace.switch(index, window, cx);
+                                        if event.click_count() == 2 && workspace.active == index {
+                                            workspace.active().update(cx, |view, cx| {
+                                                view.open_rename_document(window, cx);
+                                            });
+                                        }
                                     });
                                 })
                         }),

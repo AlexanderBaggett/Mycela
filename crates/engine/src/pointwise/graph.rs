@@ -373,6 +373,7 @@ impl<E> NodeCore<E> {
             PointwiseKind::Polygon
             | PointwiseKind::Reference
             | PointwiseKind::MakeEnvironment
+            | PointwiseKind::Checkerboard
             | PointwiseKind::Shader => &[],
             PointwiseKind::Frequency
             | PointwiseKind::Equalize

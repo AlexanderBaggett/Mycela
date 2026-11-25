@@ -15,3 +15,4 @@ pub(crate) use view::{SourceAnimationFrame, open_solid_animation_window};
 
 pub(crate) use view::custom::{CustomAction, CustomDraft, render_custom_points};
 pub(crate) use view::modulation::{ModulationAction, ModulationTarget, render_layer_modulation};
+pub(crate) use view::numeric_field::{NumericField, NumericRange};

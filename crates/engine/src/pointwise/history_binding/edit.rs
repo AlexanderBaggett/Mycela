@@ -864,18 +864,13 @@ impl<E: 'static> PointwiseHistorySlot<E> {
         self.replace_document_branch_with_label(node, record, label, None, lab)
     }
 
-    pub(crate) fn append_document_branch(
+    pub(crate) fn insert_document_branch(
         &self,
         node: &PointwiseNode<E>,
         order: BranchOrderChange,
+        label: &'static str,
     ) -> Result<(), HistoryError<E>> {
-        self.replace_document_branch_with_label(
-            Some(node),
-            true,
-            Some("Add Branch"),
-            Some(order),
-            None,
-        )
+        self.replace_document_branch_with_label(Some(node), true, Some(label), Some(order), None)
     }
 
     pub(crate) fn delete_current(

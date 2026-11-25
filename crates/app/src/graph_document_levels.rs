@@ -4,12 +4,13 @@ use super::{
     model::{self, Node, Ticket, failure},
 };
 use crate::ForegroundError;
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use gpui_kit::base::{Disableable, Selectable, StyledExt, TestSupportExt};
 use gpui_kit::component::{
     ActiveTheme, Sizable,
     button::{Button, ButtonVariants},
     form::Field,
-    input::{Input, InputEvent, InputState},
+    input::{InputEvent, InputState},
 };
 use gpui_kit::{
     App, AppContext, Bounds, Context, DispatchPhase, Entity, EventEmitter, FocusHandle,
@@ -622,11 +623,25 @@ impl Render for LevelsEditor {
                     .zip(&self.inputs)
                     .map(|(control, input)| {
                         Field::new().label(control.label()).child(
-                            Input::new(input)
-                                .id(control.id())
-                                .aria_label(control.label())
-                                .small()
-                                .disabled(disabled),
+                            NumericField::new(
+                                input,
+                                control.id(),
+                                control.label(),
+                                NumericRange::bounds(
+                                    match control {
+                                        PointControl::BlackPoint => {
+                                            [-10.0, (self.points.white_point() - 0.01).min(10.0)]
+                                        }
+                                        PointControl::Gamma => [0.01, 9.999],
+                                        PointControl::WhitePoint => {
+                                            [(self.points.black_point() + 0.01).max(-10.0), 10.0]
+                                        }
+                                    },
+                                    0.001,
+                                ),
+                            )
+                            .submit_on_release()
+                            .disabled(disabled),
                         )
                     }),
             )

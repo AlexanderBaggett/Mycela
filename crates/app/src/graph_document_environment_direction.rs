@@ -1,12 +1,13 @@
 //! A direction picker for the light and mixer fields of the selected layer.
 use super::{GraphDocumentView, Target};
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use gpui_kit::base::{Disableable, StyledExt, TestSupportExt};
 use gpui_kit::component::{
     ActiveTheme, Sizable, WindowExt,
     button::{Button, ButtonVariants},
     dialog::{DialogAction, DialogClose, DialogFooter},
     form::{Field, Form},
-    input::{Input, InputState},
+    input::InputState,
 };
 use gpui_kit::{
     App, AppContext, Bounds, Context, Corners, DispatchPhase, Entity, IntoElement, MouseButton,
@@ -226,20 +227,18 @@ impl Render for Picker {
             .child(
                 Form::new()
                     .columns(2)
-                    .child(
-                        Field::new().label("Rotation").child(
-                            Input::new(&self.inputs[0])
-                                .id("environment-direction-rotation")
-                                .aria_label("Rotation in degrees"),
-                        ),
-                    )
-                    .child(
-                        Field::new().label("Elevation").child(
-                            Input::new(&self.inputs[1])
-                                .id("environment-direction-elevation")
-                                .aria_label("Elevation in degrees"),
-                        ),
-                    ),
+                    .child(Field::new().label("Rotation").child(NumericField::new(
+                        &self.inputs[0],
+                        "environment-direction-rotation",
+                        "Rotation in degrees",
+                        NumericRange::new(0.0, 360.0, 0.1),
+                    )))
+                    .child(Field::new().label("Elevation").child(NumericField::new(
+                        &self.inputs[1],
+                        "environment-direction-elevation",
+                        "Elevation in degrees",
+                        NumericRange::new(0.0, 90.0, 0.1),
+                    ))),
             )
             .when_some(error, |element, error| {
                 element.child(div().text_sm().text_color(theme.danger).child(error))

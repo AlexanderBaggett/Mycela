@@ -1,6 +1,7 @@
 //! Style pass authoring in the graph inspector.
 use super::environment::EnvironmentPanel;
 use super::*;
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use gpui_kit::{AnyElement, SharedString, WeakEntity};
 use mycela_engine::{
     BinaryCursor, BinaryWriter, CanvasLayerEditor, EnvironmentRecord, SharedCurve, StyleControl,
@@ -632,12 +633,15 @@ impl GraphDocumentView {
                     |(index, (control, input))| {
                         let label = control.label();
                         match control.kind() {
-                            StyleControlKind::Number(_) => Some(
+                            StyleControlKind::Number(bounds) => Some(
                                 Field::new().label(label).child(
-                                    Input::new(input.as_ref()?)
-                                        .id(("style-number", index))
-                                        .small()
-                                        .disabled(busy || synthesis_pending || gradient_pending),
+                                    NumericField::new(
+                                        input.as_ref()?,
+                                        ("style-number", index),
+                                        label,
+                                        NumericRange::bounds(bounds, 0.01),
+                                    )
+                                    .disabled(busy || synthesis_pending || gradient_pending),
                                 ),
                             ),
                             StyleControlKind::Toggle => {

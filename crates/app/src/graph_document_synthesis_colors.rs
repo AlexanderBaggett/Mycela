@@ -1,6 +1,7 @@
 //! Typed Lab Color and direct RGB authoring for Synthesis.
 use super::super::gradient::ColorAdjusterMenu;
 use super::*;
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use gpui_kit::{Rgba, component::IconName};
 use mycela_engine::{ColorAdjusterLink, SynthesisColorTarget};
 
@@ -68,8 +69,8 @@ impl GraphDocumentView {
                 .enumerate()
                 .filter(|(_, (field, _))| field.color_target() == Some(color))
                 .zip(channels.into_iter().zip(rgb))
-                .map(|((index, (_, input)), ((channel_id, label), value))| {
-                    let field = if has_link {
+                .map(|((index, (field, input)), ((channel_id, label), value))| {
+                    let control = if has_link {
                         let text = format!("{value:.6}");
                         let text = text.trim_end_matches('0').trim_end_matches('.');
                         adjusters::render_synthesis_readout(
@@ -79,13 +80,16 @@ impl GraphDocumentView {
                             cx,
                         )
                     } else {
-                        Input::new(input)
-                            .id(("synthesis-control", index))
-                            .small()
-                            .disabled(busy)
-                            .into_any_element()
+                        NumericField::new(
+                            input,
+                            ("synthesis-control", index),
+                            label,
+                            NumericRange::bounds(field.range(), 0.001),
+                        )
+                        .disabled(busy)
+                        .into_any_element()
                     };
-                    Field::new().label(label).child(field)
+                    Field::new().label(label).child(control)
                 }),
         );
         let menu = if target.material_linked() {

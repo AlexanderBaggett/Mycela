@@ -102,6 +102,7 @@ pub enum PointwiseKind {
     Canvas,
     Style,
     Synthesis,
+    Checkerboard,
 }
 impl PointwiseKind {
     pub(super) fn has_compact_inputs(self) -> bool {
@@ -127,7 +128,7 @@ impl PointwiseKind {
             | Self::TemplateLab(_)
             | Self::Canvas
             | Self::WizardReference => 20,
-            Self::Polygon | Self::Reference | Self::Shader => 0,
+            Self::Polygon | Self::Reference | Self::Shader | Self::Checkerboard => 0,
             Self::FullLight | Self::OklabColor => 4,
             Self::Add
             | Self::Multiply
@@ -212,6 +213,7 @@ impl PointwiseKind {
             Self::Multiply => "A*B",
             Self::FromHsb => "From HSB",
             Self::OklabColor => "Oklab Color",
+            Self::Checkerboard => "Checkerboard",
             Self::Shader => "Shader",
             Self::ClearMaps => "Clear Maps",
             Self::StoreMap => "Store Map",
@@ -803,6 +805,33 @@ fn number<E>(
             limits: limits(places, min, max, wrap, extended)?,
         },
     })
+}
+fn checkerboard_parameters<E>() -> Result<Vec<ParameterState<E>>, ImageError> {
+    let color = |name, value| ParameterState {
+        extras: ParameterExtras::with_ordinary_limits(),
+        choice_memory: None,
+        name: text(name),
+        value: PointwiseParameterValue::Color(crate::ContextColorValue::unlinked([value; 3])),
+    };
+    let unsigned = |name, default, maximum| -> Result<_, ImageError> {
+        Ok(ParameterState {
+            extras: ParameterExtras::default(),
+            choice_memory: None,
+            name: text(name),
+            value: PointwiseParameterValue::Number {
+                current: default,
+                previous: default,
+                limits: limits(0, 1, maximum, false, false)?,
+            },
+        })
+    };
+    Ok(vec![
+        color("Color 1", 0.0),
+        color("Color 2", 1.0),
+        unsigned("X", 1.0, super::checkerboard::MAX_CELL_SIZE)?,
+        unsigned("Y", 1.0, super::checkerboard::MAX_CELL_SIZE)?,
+        unsigned("Scale", 2.0, super::checkerboard::MAX_SCALE)?,
+    ])
 }
 fn lab_scale_and_seed<E>() -> Result<[ParameterState<E>; 2], ImageError> {
     let make = |name: &str, definition| -> Result<ParameterState<E>, ImageError> {
@@ -1423,6 +1452,7 @@ impl<E> PointwiseFilter<E> {
             PointwiseKind::ShadowG2 => point_light::shadow_g2_parameters()?,
             PointwiseKind::Polygon => transform_parameters::polygon_parameters(mode)?,
             PointwiseKind::OklabColor => oklab_parameters()?,
+            PointwiseKind::Checkerboard => checkerboard_parameters()?,
             PointwiseKind::Shader => Vec::new(),
             PointwiseKind::LegacyBricksBoards => transform_parameters::parameters(kind, mode)?,
             PointwiseKind::Regions => vec![
@@ -3198,6 +3228,9 @@ impl<E> PointwiseParameter<E> {
     }
 
     fn store_number(&self, value: f64) -> Result<Option<(f64, f64)>, PointwiseError<E>> {
+        if self.owner.kind() == PointwiseKind::Checkerboard && value.fract() != 0.0 {
+            return Err(ImageError::Argument.into());
+        }
         let limits = match self.value() {
             PointwiseParameterValue::Number { limits, .. } => limits,
             _ => return Ok(None),

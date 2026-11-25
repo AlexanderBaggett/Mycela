@@ -113,7 +113,7 @@ fn catalog_group(kind: PointwiseKind) -> &'static str {
         | PointwiseKind::MapVariable
         | PointwiseKind::WizardReference
         | PointwiseKind::TemplateLab(_) => "Groups",
-        PointwiseKind::Canvas => "Generate",
+        PointwiseKind::Canvas | PointwiseKind::Checkerboard => "Generate",
         PointwiseKind::Style | PointwiseKind::Synthesis => "Advanced",
         PointwiseKind::ChangeBci
         | PointwiseKind::ChangeHsb

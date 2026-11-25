@@ -345,6 +345,7 @@ impl<E> PointwiseFilter<E> {
             | PointwiseKind::Multiply
             | PointwiseKind::FromHsb
             | PointwiseKind::OklabColor
+            | PointwiseKind::Checkerboard
             | PointwiseKind::Shader
             | PointwiseKind::ClearMaps
             | PointwiseKind::StoreMap

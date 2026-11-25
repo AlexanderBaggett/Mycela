@@ -123,6 +123,7 @@ impl<E: 'static> PointwiseNode<E> {
                                 | PointwiseKind::Multiply
                                 | PointwiseKind::FromHsb
                                 | PointwiseKind::OklabColor
+                                | PointwiseKind::Checkerboard
                                 | PointwiseKind::Shader
                                 | PointwiseKind::Reflect
                                 | PointwiseKind::Refract

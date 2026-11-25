@@ -1,5 +1,6 @@
 //! Authoring for the coupled position and RGBA stops in Colorize G2.
 use super::{GraphDocumentView, model::failure};
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 #[path = "graph_document_legacy_gradient_strip.rs"]
 mod strip_view;
 use crate::ForegroundError;
@@ -9,7 +10,7 @@ use gpui_kit::component::{
     button::Button,
     color_picker::ColorPickerState,
     form::Field,
-    input::{Input, InputState},
+    input::InputState,
     menu::{DropdownMenu, PopupMenuItem},
     popover::Popover,
     slider::Slider,
@@ -39,13 +40,16 @@ impl FieldDraft {
         (text.as_ref() != self.loaded).then_some(text)
     }
 
-    fn render(&self, id: impl Into<gpui_kit::ElementId>, label: &str, disabled: bool) -> Field {
-        Field::new().label(label.to_owned()).child(
-            Input::new(&self.input)
-                .id(id)
-                .aria_label(label.to_owned())
-                .disabled(disabled),
-        )
+    fn render(
+        &self,
+        id: impl Into<gpui_kit::ElementId>,
+        label: &str,
+        range: NumericRange,
+        disabled: bool,
+    ) -> Field {
+        Field::new()
+            .label(label.to_owned())
+            .child(NumericField::new(&self.input, id, label.to_owned(), range).disabled(disabled))
     }
 }
 
@@ -452,11 +456,12 @@ impl GraphDocumentView {
             .gap_2()
             .child(div().font_semibold().child("Color Gradient"))
             .child(self.render_legacy_strip(editor, positions.clone(), disabled, cx))
-            .child(
-                editor
-                    .steps
-                    .render("graph-legacy-gradient-steps", "Steps", disabled),
-            )
+            .child(editor.steps.render(
+                "graph-legacy-gradient-steps",
+                "Steps",
+                NumericRange::new(1.0, 10_000.0, 1.0),
+                disabled,
+            ))
             .child(
                 div()
                     .h_flex()
@@ -491,17 +496,25 @@ impl GraphDocumentView {
             .when_some(editor.selected.as_ref(), |group, (_, fields)| {
                 group
                     .child(self.render_legacy_picker(editor, disabled, cx))
-                    .children(COMPONENTS.iter().zip(fields).map(|(label, field)| {
-                        field.render(
-                            format!("graph-legacy-gradient-{}", label.to_ascii_lowercase()),
-                            label,
-                            disabled,
-                        )
-                    }))
+                    .children(COMPONENTS.iter().zip(fields).enumerate().map(
+                        |(index, (label, field))| {
+                            field.render(
+                                format!("graph-legacy-gradient-{}", label.to_ascii_lowercase()),
+                                label,
+                                if index == 0 {
+                                    NumericRange::new(0.0, 1.0, 0.001)
+                                } else {
+                                    NumericRange::new(-100.0, 100.0, 0.001)
+                                },
+                                disabled,
+                            )
+                        },
+                    ))
             })
             .child(editor.new_position.render(
                 "graph-legacy-gradient-new-position",
                 "New stop position",
+                NumericRange::new(0.0, 1.0, 0.001),
                 disabled,
             ))
             .child(

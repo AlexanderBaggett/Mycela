@@ -143,6 +143,7 @@ const IMAGE_FAMILIES: &[Family] = &[
             "Atmosphere",
             "Bricks & Boards",
             "Cells",
+            "Checkerboard",
             "Gradient",
             "Hair",
             "Imported Image",

@@ -6,7 +6,7 @@ use gpui_kit::component::{
     button::Button,
     checkbox::Checkbox,
     form::{Field, Form},
-    input::{Input, InputState},
+    input::InputState,
     menu::{DropdownMenu, PopupMenuItem},
 };
 use gpui_kit::{AnyElement, App, AppContext, Entity, IntoElement, Window, div, prelude::*};
@@ -284,10 +284,17 @@ impl CustomDraft {
                 [("x", "X"), ("y", "Y")].into_iter().zip(&self.fields).map(
                     |((suffix, label), field)| {
                         Field::new().label(label).child(
-                            Input::new(field)
-                                .id(format!("{id}-{suffix}"))
-                                .aria_label(format!("Point {label}"))
-                                .disabled(disabled),
+                            crate::graph_document::NumericField::new(
+                                field,
+                                format!("{id}-{suffix}"),
+                                format!("Point {label}"),
+                                if suffix == "x" {
+                                    crate::graph_document::NumericRange::new(0.0, 1.0, 0.001)
+                                } else {
+                                    crate::graph_document::NumericRange::new(-1000.0, 1000.0, 0.001)
+                                },
+                            )
+                            .disabled(disabled),
                         )
                     },
                 ),

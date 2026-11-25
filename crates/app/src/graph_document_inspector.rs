@@ -5,6 +5,7 @@ use super::view::environment::EnvironmentPanel;
 use super::view::gradient::{EnvironmentGradientKind, GradientEditor};
 use super::view::legacy_gradient::LegacyGradientEditor;
 use super::view::levels::LevelsEditor;
+use super::view::numeric_field::{NumericField, NumericRange};
 use super::view::selector::SelectorColorEditor;
 use crate::ForegroundError;
 use gpui_kit::component::input::InputState;
@@ -373,6 +374,9 @@ impl Binding {
         if !value.is_finite() {
             return Err("Enter a finite number.".into());
         }
+        if self.is_checkerboard_dimension() && value.fract() != 0.0 {
+            return Err("Enter a whole number.".into());
+        }
         if let Some(limits) = self.limits() {
             let bounds = limits.snapshot();
             let minimum = bounds.minimum.to_framework_f64();
@@ -382,6 +386,13 @@ impl Binding {
             }
         }
         Ok(value)
+    }
+    fn is_checkerboard_dimension(&self) -> bool {
+        matches!(
+            self,
+            Self::Number(property)
+                if property.owner().kind() == mycela_engine::PointwiseKind::Checkerboard
+        )
     }
     fn commit(&self, text: &str) -> Result<(), String> {
         let variable_index = || {
@@ -530,6 +541,90 @@ fn color_byte_text(normalized: f64) -> String {
 }
 
 impl Draft {
+    pub(super) fn filter_color_component(&self) -> Option<(&Parameter, usize)> {
+        match &self.binding {
+            Binding::FilterColor(property, axis) => Some((property, *axis)),
+            _ => None,
+        }
+    }
+
+    pub(super) fn control(&self, disabled: bool) -> NumericField {
+        use Binding::*;
+        // These legacy fields accept any finite value. Keep a usable thumb
+        // range around the editor's ordinary units and include imported values.
+        let flexible = |minimum: f64, maximum: f64, step| {
+            NumericRange::new(minimum, maximum, step)
+                .including(self.loaded.parse::<f64>().unwrap_or(0.0))
+        };
+        let percent = NumericRange::new(0.0, 100.0, 0.1);
+        let unit = NumericRange::new(0.0, 1.0, 0.001);
+        let color = NumericRange::new(0.0, 255.0, 1.0);
+        let range = self
+            .binding
+            .limits()
+            .as_ref()
+            .and_then(NumericRange::from_limits)
+            .or_else(|| {
+                Some(match &self.binding {
+                    CanvasArea(_, field) => NumericRange::bounds(field.bounds(), 0.1),
+                    CanvasShape(_, field) => NumericRange::bounds(field.bounds(), 0.1),
+                    Environment(_, field) => NumericRange::bounds(field.bounds(), 0.01),
+                    VariableIndex(_) | GeneratorVariableIndex(_) | SolidVariableIndex(..) => {
+                        NumericRange::new(-1.0, 19.0, 1.0)
+                    }
+                    FilterColor(..) => unit,
+                    RegionCoordinate(_, region, axis) => {
+                        let (_, x, y, height) = region.fields();
+                        let aspect = region.aspect();
+                        let maximum = match axis {
+                            0 => (1.0 - height * aspect).max(0.0),
+                            1 => (1.0 - height).max(0.0),
+                            _ => ((1.0 - x) / aspect).min(1.0 - y).clamp(0.0, 1.0),
+                        };
+                        NumericRange::bounds([0.0, maximum], 0.001)
+                    }
+                    Color(..) | Transparency(_) => color,
+                    Matrix(_, true) => flexible(0.0, 100.0, 0.1),
+                    Matrix(_, false) => flexible(-360.0, 360.0, 1.0),
+                    LightPosition(..) => flexible(-3.0, 3.0, 0.01),
+                    AnimationBound(parameter, ..) if parameter.has_animation_palette() => percent,
+                    AnimationBound(parameter, _, _, axis, _) => match parameter {
+                        AnimationParameter::DirectCurve(p) | AnimationParameter::Filter(p) => {
+                            p.retained_limits()
+                        }
+                        AnimationParameter::Generator(p) => p.limits().ok(),
+                        AnimationParameter::Modern(p) => p.component_limits(*axis),
+                        AnimationParameter::Solid(..) => return Some(unit),
+                    }
+                    .as_ref()
+                    .and_then(NumericRange::from_limits)
+                    .unwrap_or_else(|| flexible(0.0, 100.0, 0.1)),
+                    LayerScalar(_, control) => control
+                        .bounds()
+                        .map(|bounds| NumericRange::bounds(bounds, 0.1))
+                        .unwrap_or_else(|| flexible(-100.0, 100.0, 0.1)),
+                    GradientStop(editor, _, 0) => NumericRange::new(
+                        0.0,
+                        f64::from(editor.width().saturating_sub(1).max(0)),
+                        1.0,
+                    ),
+                    GradientStop(..) => unit,
+                    Number(_) | Generator(_) | GeneratorAxis(..) | Axis(..) | Modern(_)
+                    | ModernAxis(..) => flexible(-100.0, 100.0, 0.1),
+                    Text(_)
+                    | VariableMapping(_)
+                    | GeneratorVariableMapping(_)
+                    | SolidVariableMapping(..) => return None,
+                })
+            });
+        let checkerboard_dimension = self.binding.is_checkerboard_dimension();
+        NumericField::new(&self.input, self.id.clone(), self.label.clone(), range)
+            .disabled(disabled)
+            .live(self.is_live() && !self.changes_socket_count())
+            .logarithmic(checkerboard_dimension)
+            .whole_numbers(checkerboard_dimension)
+    }
+
     fn new(
         id: String,
         label: String,
@@ -1492,6 +1587,7 @@ pub(crate) struct Inspector {
     pub mask_gradient: Option<GradientEditor>,
     pub legacy_gradient: Option<LegacyGradientEditor>,
     pub selector_color: Option<SelectorColorEditor>,
+    pub(super) checkerboard_color_open: Option<usize>,
     pub levels: Option<Entity<LevelsEditor>>,
     pub environment: Option<EnvironmentPanel>,
     pub environment_panels: Vec<EnvironmentPanel>,
@@ -2212,6 +2308,11 @@ impl Inspector {
             if filter.kind() == mycela_engine::PointwiseKind::OklabColor {
                 view.notes
                     .push(crate::filter_stack::OKLAB_INPUT_HELP.into());
+            }
+            if filter.kind() == mycela_engine::PointwiseKind::Checkerboard {
+                view.notes.push(
+                    "X and Y set the cell proportions. Scale repeats whole checker pairs to keep the texture seamless.".into(),
+                );
             }
             let controls = if matches!(
                 filter.kind(),

@@ -1,7 +1,7 @@
 use gpui_kit::{AssetSource, SharedString, assets::Assets};
 use std::borrow::Cow;
 
-gpui_kit::assets::icon_assets!(CommandIcons, [Save, SaveAll, Download, ZoomIn, ZoomOut]);
+gpui_kit::assets::icon_assets!(CommandIcons, [Save, Download, ZoomIn, ZoomOut]);
 
 struct MycelaAssets;
 

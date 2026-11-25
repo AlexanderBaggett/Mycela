@@ -1,4 +1,5 @@
 //! Shared command, copy list, and transform controls for the Manual editor.
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{
     StyledExt, TestSupportExt,
@@ -8,7 +9,7 @@ use gpui_kit::component::{
     ActiveTheme, Disableable, Sizable,
     button::{Button, ButtonVariants},
     form::{Field, Form},
-    input::{Input, InputEvent, InputState},
+    input::{InputEvent, InputState},
     list::ListItem,
     menu::{DropdownMenu, PopupMenuItem},
     scroll::ScrollableElement,
@@ -573,13 +574,21 @@ impl ManualNumbers {
                             Height => "Height (%)",
                             Angle => "Angle (°)",
                         };
-                        Field::new().label(label).child(
-                            Input::new(input)
-                                .id((id, index))
-                                .small()
-                                .aria_label(label)
-                                .disabled(disabled),
-                        )
+                        let limits = field.limits();
+                        let control = NumericField::new(
+                            input,
+                            (id, index),
+                            label,
+                            NumericRange::bounds(limits, 0.01),
+                        );
+                        let control = if *field == Angle {
+                            control
+                        } else {
+                            control.focus_travel(limits.map(|limit| limit.clamp(-100.0, 100.0)))
+                        };
+                        Field::new()
+                            .label(label)
+                            .child(control.submit_on_release().disabled(disabled))
                     }),
             ),
         )

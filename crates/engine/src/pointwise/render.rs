@@ -1102,6 +1102,10 @@ impl<E: 'static> PointwiseFilter<E> {
                 &|| false,
             )
             .map(Some),
+            PointwiseKind::Checkerboard => {
+                super::checkerboard::render(self, ImageGeometry::new(width, height), 0.0, &|| false)
+                    .map(Some)
+            }
             PointwiseKind::ClearMaps
             | PointwiseKind::StoreMap
             | PointwiseKind::MergeMaps
@@ -1857,6 +1861,15 @@ impl<E: 'static> PointwiseFilter<E> {
             )
             .map(Some);
         }
+        if self.kind() == PointwiseKind::Checkerboard {
+            return super::checkerboard::render(
+                self,
+                ImageGeometry::new(width, height),
+                time,
+                effects.cancel_check(),
+            )
+            .map(Some);
+        }
         if self.kind() == PointwiseKind::ColorizeG2 {
             return super::colorize_g2::retained(
                 self,
@@ -2189,6 +2202,15 @@ impl<E: 'static> PointwiseFilter<E> {
             return super::oklab::render(
                 self,
                 inputs,
+                ImageGeometry::new(width, height),
+                time,
+                &|| false,
+            )
+            .map(Some);
+        }
+        if self.kind() == PointwiseKind::Checkerboard {
+            return super::checkerboard::render(
+                self,
                 ImageGeometry::new(width, height),
                 time,
                 &|| false,

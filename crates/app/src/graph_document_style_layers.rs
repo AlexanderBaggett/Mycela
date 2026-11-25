@@ -1,5 +1,6 @@
 //! Canvas layer commands share the retained layer handles used by Style and drawing.
 use super::*;
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use mycela_engine::{CanvasSymmetry, PointwiseKind};
 
 #[derive(Clone)]
@@ -497,13 +498,12 @@ impl Render for Properties {
                                 .aria_label("Name"),
                         ),
                     )
-                    .child(
-                        Field::new().label("Style scale").child(
-                            Input::new(&self.scale)
-                                .id("canvas-layer-scale")
-                                .aria_label("Style scale"),
-                        ),
-                    ),
+                    .child(Field::new().label("Style scale").child(NumericField::new(
+                        &self.scale,
+                        "canvas-layer-scale",
+                        "Style scale",
+                        NumericRange::new(-20.0, 20.0, 0.01),
+                    ))),
             )
             .when_some(self.error.as_ref(), |form, error| {
                 form.child(

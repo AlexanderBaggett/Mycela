@@ -131,6 +131,7 @@ impl GraphDocumentView {
                                 | mycela_engine::PointwiseKind::Distort
                                 | mycela_engine::PointwiseKind::ChangeBci
                                 | mycela_engine::PointwiseKind::ChangeHsb
+                                | mycela_engine::PointwiseKind::Checkerboard
                                 | mycela_engine::PointwiseKind::Exposure
                                 | mycela_engine::PointwiseKind::Selector
                                 | mycela_engine::PointwiseKind::MatchColor
@@ -242,6 +243,11 @@ impl GraphDocumentView {
         let Some(history) = self.history() else {
             return;
         };
+        let output = self
+            .canvas
+            .visible
+            .then(|| self.canvas_output_screen(window))
+            .flatten();
         self.revision += 1;
         self.cancel_preview();
         let result = match direction {
@@ -251,6 +257,7 @@ impl GraphDocumentView {
         self.status = None;
         self.error = result.err().map(|error| error.to_string());
         self.rebuild(window, cx);
+        self.restore_canvas_output(output, window);
         self.start_preview(cx);
     }
 

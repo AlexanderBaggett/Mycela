@@ -628,6 +628,14 @@ impl<E: 'static> PointwiseNode<E> {
                 result.constants[1..].fill(Some(0.0));
             }
             Payload::Filter {
+                kind: PointwiseKind::Checkerboard,
+                ..
+            } => {
+                result.constants[3] = Some(0.0);
+                result.in_range.fill(true);
+                result.has_scene = false;
+            }
+            Payload::Filter {
                 kind: PointwiseKind::Polygon,
                 ..
             } => {

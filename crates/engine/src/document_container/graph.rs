@@ -148,6 +148,7 @@ pub(crate) struct BranchOrderChange {
     order: Arc<Mutex<BranchOrder>>,
     before: Vec<usize>,
     after: Vec<usize>,
+    position: Option<BranchPositionEdit>,
 }
 
 impl BranchOrderChange {
@@ -159,19 +160,38 @@ impl BranchOrderChange {
             order: order.clone(),
             before,
             after,
+            position: None,
         }
     }
 
     pub(crate) fn matches(&self, undo: bool) -> bool {
-        &BranchOrder::lock(&self.order).slots == if undo { &self.after } else { &self.before }
+        let order = BranchOrder::lock(&self.order);
+        &order.slots == if undo { &self.after } else { &self.before }
+            && self.position.as_ref().is_none_or(|position| {
+                order.positions[position.slot].map(f32::to_bits)
+                    == (if undo {
+                        position.after
+                    } else {
+                        position.before
+                    })
+                    .map(f32::to_bits)
+            })
     }
 
     pub(crate) fn publish(&self, undo: bool) {
-        BranchOrder::lock(&self.order).slots = if undo {
+        let mut order = BranchOrder::lock(&self.order);
+        order.slots = if undo {
             self.before.clone()
         } else {
             self.after.clone()
         };
+        if let Some(position) = &self.position {
+            order.positions[position.slot] = if undo {
+                position.before
+            } else {
+                position.after
+            };
+        }
     }
 }
 
@@ -720,18 +740,93 @@ impl<E: 'static> Gtx375GraphDocument<E> {
         node: PointwiseNode<E>,
         position: [f32; 2],
     ) -> Result<usize, GtxGraphError<E>> {
+        self.insert_document_root(node, position, false)
+    }
+
+    /// Dock a tree in the principal branch. The outgoing texture stays in
+    /// the graph, taking the incoming tree's loose position when there is one.
+    pub fn dock_texture_output(&mut self, node: PointwiseNode<E>) -> Result<(), GtxGraphError<E>> {
+        if self
+            .branch(0)
+            .flatten()
+            .is_some_and(|root| root.same_reference(&node))
+        {
+            return Ok(());
+        }
+        self.insert_document_root(node, [0.; 2], true).map(|_| ())
+    }
+
+    /// Move the complete output tree to a loose branch at the dropped position.
+    pub fn detach_texture_output_at(
+        &mut self,
+        position: [f32; 2],
+    ) -> Result<usize, GtxGraphError<E>> {
+        let root = self.branch(0).flatten().ok_or(GtxGraphError::BranchIndex)?;
+        if let Branches::Unbound(branches) = &mut self.branches {
+            if !position.into_iter().all(f32::is_finite) {
+                return Err(GtxGraphError::BranchIndex);
+            }
+            let index = branches.len();
+            count_i32(index + 1)?;
+            reserve(branches, 1)?;
+            reserve(&mut self.positions, 1)?;
+            branches[0] = None;
+            branches.push(Some(root));
+            self.positions.push(position);
+            return Ok(index);
+        }
+        self.append_branch_at(root, position)
+    }
+
+    fn insert_document_root(
+        &mut self,
+        node: PointwiseNode<E>,
+        position: [f32; 2],
+        dock: bool,
+    ) -> Result<usize, GtxGraphError<E>> {
         if !position.into_iter().all(f32::is_finite) {
             return Err(GtxGraphError::BranchIndex);
         }
         let index = self.branches.len();
         count_i32(index + 1)?;
+        let loose_source = dock
+            .then(|| {
+                self.branches()
+                    .iter()
+                    .enumerate()
+                    .skip(1)
+                    .find_map(|(index, branch)| {
+                        branch
+                            .as_ref()
+                            .is_some_and(|root| root.same_reference(&node))
+                            .then_some(index)
+                    })
+            })
+            .flatten();
+        let occupied = dock && self.branch(0).ok_or(GtxGraphError::BranchIndex)?.is_some();
         node.set_document_preview_samples(&self.preview_samples);
         match &mut self.branches {
             Branches::Unbound(branches) => {
-                reserve(branches, 1)?;
-                reserve(&mut self.positions, 1)?;
-                branches.push(Some(node));
-                self.positions.push(position);
+                if let Some(source) = loose_source {
+                    branches.swap(0, source);
+                    if !occupied {
+                        branches.remove(source);
+                        self.positions.remove(source - 1);
+                    }
+                } else {
+                    reserve(branches, 1)?;
+                    reserve(&mut self.positions, 1)?;
+                    if dock {
+                        node.set_parent(None).map_err(slot_edit_error)?;
+                        if let Some(previous) = branches[0].replace(node) {
+                            branches.push(Some(previous));
+                            self.positions.push(position);
+                        }
+                    } else {
+                        branches.push(Some(node));
+                        self.positions.push(position);
+                    }
+                }
             }
             Branches::Bound {
                 slots,
@@ -740,15 +835,43 @@ impl<E: 'static> Gtx375GraphDocument<E> {
             } => {
                 reserve(slots, 1)?;
                 let physical = slots.len();
-                let change = BranchOrderChange::new(order, |next| next.push(physical));
+                let mut change = BranchOrderChange::new(order, |next| {
+                    if !dock {
+                        next.push(physical);
+                        return;
+                    }
+                    let previous = std::mem::replace(&mut next[0], physical);
+                    match loose_source {
+                        Some(source) if occupied => next[source] = previous,
+                        Some(source) => {
+                            next.remove(source);
+                        }
+                        None if occupied => next.push(previous),
+                        None => {}
+                    }
+                });
                 {
                     let mut current = BranchOrder::lock(order);
+                    if occupied && let Some(source) = loose_source {
+                        let previous = current.slots[0];
+                        change.position = Some(BranchPositionEdit {
+                            order: order.clone(),
+                            slot: previous,
+                            before: current.positions[previous],
+                            after: current.positions[current.slots[source]],
+                        });
+                    }
                     reserve(&mut current.positions, 1)?;
                     current.positions.push(position);
                 }
                 let slot = crate::PointwiseHistorySlot::bind(&node, history, Vec::new());
                 slots.push(slot.clone());
-                if let Err(error) = slot.append_document_branch(&node, change) {
+                let label = if dock {
+                    "Set Texture Output"
+                } else {
+                    "Add Branch"
+                };
+                if let Err(error) = slot.insert_document_branch(&node, change, label) {
                     let mut current = BranchOrder::lock(order);
                     if !current.slots.contains(&physical) {
                         slots.pop();
@@ -760,7 +883,7 @@ impl<E: 'static> Gtx375GraphDocument<E> {
                 }
             }
         }
-        Ok(index)
+        Ok(if dock { 0 } else { index })
     }
     /// Replaces one document root without projecting or cloning node values.
     /// Slot Parent relationships remain owned by the actual graph APIs.
@@ -7127,6 +7250,80 @@ mod environment_catalog_tests {
         assert_eq!(reopened.positions().as_ref(), &[[-135., 76.]]);
         let loaded_group = reopened.branch(0).unwrap().unwrap().filter().unwrap();
         assert_eq!(loaded_group.group_content_positions(), [[110., -77.]]);
+    }
+
+    #[test]
+    fn docking_a_nested_tree_preserves_the_displaced_output_and_its_history() {
+        for recording in [false, true] {
+            let output = PointwiseNode::<()>::invert();
+            let source = PointwiseNode::solid_color().unwrap();
+            let input = output.slot(0).unwrap();
+            input.set_node(Some(&source)).unwrap();
+            let mut document = Gtx375GraphDocument::new(vec![Some(output.clone())]).unwrap();
+            let history = recording.then(|| {
+                let history = document
+                    .bind_property_history(Arc::new(LabTestHistory))
+                    .unwrap();
+                history.set_recording(true);
+                history
+            });
+            document.dock_texture_output(source.clone()).unwrap();
+            assert!(
+                document
+                    .branch(0)
+                    .flatten()
+                    .unwrap()
+                    .same_reference(&source)
+            );
+            assert!(
+                document
+                    .branch(1)
+                    .flatten()
+                    .unwrap()
+                    .same_reference(&output)
+            );
+            assert!(input.node().is_none_or(|node| node.is_default_input()));
+            if let Some(history) = &history {
+                assert_eq!(history.commands().len(), 1);
+                history.undo().unwrap();
+                assert!(
+                    document
+                        .branch(0)
+                        .flatten()
+                        .unwrap()
+                        .same_reference(&output)
+                );
+                assert!(
+                    output
+                        .slot(0)
+                        .unwrap()
+                        .node()
+                        .unwrap()
+                        .same_reference(&source)
+                );
+                history.redo().unwrap();
+            }
+            let loose = document.detach_texture_output_at([40.0, 30.0]).unwrap();
+            assert!(document.branch(0).unwrap().is_none());
+            assert!(
+                document
+                    .branch(loose)
+                    .flatten()
+                    .unwrap()
+                    .same_reference(&source)
+            );
+            assert_eq!(document.positions()[loose - 1], [40.0, 30.0]);
+            if let Some(history) = history {
+                history.undo().unwrap();
+                assert!(
+                    document
+                        .branch(0)
+                        .flatten()
+                        .unwrap()
+                        .same_reference(&source)
+                );
+            }
+        }
     }
 
     #[test]

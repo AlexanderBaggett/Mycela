@@ -1,5 +1,6 @@
 //! Detached full-size editing over the shared Synthesis source guide.
 use super::*;
+use crate::graph_document::view::numeric_field::{NumericField, NumericRange};
 use gpui_kit::EventEmitter;
 use mycela_engine::SynthesisDraftPreviewTarget;
 
@@ -642,11 +643,17 @@ impl Render for FullSizeSource {
                                     .child(name),
                             )
                             .into_any_element(),
-                        None => Input::new(input)
-                            .id(("synthesis-full-size-field", index))
-                            .small()
-                            .disabled(disabled)
-                            .into_any_element(),
+                        None => NumericField::new(
+                            input,
+                            ("synthesis-full-size-field", index),
+                            field.label(),
+                            NumericRange::bounds(
+                                field.range(),
+                                if field.is_whole() { 1.0 } else { 0.01 },
+                            ),
+                        )
+                        .disabled(disabled)
+                        .into_any_element(),
                     };
                     Field::new().label(field.label()).child(item)
                 }),
