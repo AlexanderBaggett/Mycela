@@ -1449,7 +1449,7 @@ impl<E: 'static> PointwiseThumbnailRender<E> {
         time: f64,
         animated: bool,
         execution: crate::ProceduralExecution,
-        cache: &mut crate::PointwiseThumbnailCache,
+        cache: &crate::PointwiseThumbnailCache,
         effects: &mut crate::PointwiseRenderEffects<'_, E>,
     ) -> Result<crate::PointwiseRenderOutcome<E>, PointwiseError<E>> {
         use crate::pointwise::graph::{FinalImageReuse, ThumbnailReuse};
@@ -1481,7 +1481,7 @@ impl<E: 'static> PointwiseThumbnailRender<E> {
 }
 
 impl<E: 'static> PointwiseNodeRenderSnapshot<E> {
-    pub fn prepare_thumbnail(self) -> Result<PointwiseThumbnailRender<E>, PointwiseError<E>> {
+    pub fn prepare_thumbnail(mut self) -> Result<PointwiseThumbnailRender<E>, PointwiseError<E>> {
         let graph = self.node.clone_supported_final_graph()?;
         let mut seen = std::collections::HashSet::new();
         let mut ambiguous_sources = std::collections::HashSet::new();
@@ -1491,6 +1491,12 @@ impl<E: 'static> PointwiseNodeRenderSnapshot<E> {
                     ambiguous_sources.insert(source);
                 }
             }
+        } else {
+            // Captured cards can share a detached model. The original renderer
+            // updates retained inputs and caches, so each fallback worker needs
+            // its own copy just as the final renderer has its own graph.
+            self.node = RenderCaptureSession::new().copy_node_raw(&self.node)?;
+            self.origins = Arc::default();
         }
         Ok(PointwiseThumbnailRender {
             snapshot: self,
@@ -1830,6 +1836,29 @@ impl<E: 'static> PointwiseFilter<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn thumbnail_fallbacks_from_one_capture_have_private_graphs() {
+        let node = PointwiseFilter::<()>::new(PointwiseKind::ArtBlur)
+            .unwrap()
+            .node();
+        node.slot(0)
+            .unwrap()
+            .set_node(Some(&crate::PointwiseNode::solid_color().unwrap()))
+            .unwrap();
+        let mut capture = RenderFreezeSession::new();
+        let first = capture.freeze_thumbnail(&node, 0.).unwrap();
+        let second = capture.freeze_thumbnail(&node, 0.5).unwrap();
+        let ready = capture.finish().unwrap().materialize().unwrap();
+        let first = first.complete(&ready).unwrap();
+        let second = second.complete(&ready).unwrap();
+        assert!(first.graph.is_none() && second.graph.is_none());
+        assert!(!first.snapshot.node.same_reference(&second.snapshot.node));
+        let source = |thumbnail: &PointwiseThumbnailRender<()>| {
+            thumbnail.snapshot.node.slot(0).unwrap().node().unwrap()
+        };
+        assert!(!source(&first).same_reference(&source(&second)));
+    }
+
     #[test]
     fn source_copy_and_detached_capture_keep_distinct_actual_property_owners() {
         for kind in [PointwiseKind::Frequency, PointwiseKind::Fractalize] {

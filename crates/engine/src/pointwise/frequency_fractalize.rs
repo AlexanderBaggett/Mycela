@@ -3,7 +3,11 @@
 use super::numeric::{add, div, mul, sub};
 use super::{PointwiseError, PointwiseFilter, PointwiseKind, SharedImageMap};
 use crate::procedural_schedule::{for_each_chunk, for_each_row_chunk};
-use crate::{FloatBuffer, ImageError, ImageGeometry, ProceduralExecution, framework_cast::integer};
+use crate::{
+    FloatBuffer, ImageError, ImageGeometry, ProceduralExecution,
+    framework_cast::integer,
+    image_map::{read_pixel, write_pixel},
+};
 fn at(value: i32) -> Result<usize, ImageError> {
     usize::try_from(value).map_err(|_| ImageError::Index)
 }
@@ -57,8 +61,8 @@ fn frequency<E: 'static>(
         let mut channel = 0;
         while channel < source.channel_count()? as i32 {
             let values = source.channel(channel, false)?;
-            for ix in 0..values.len() {
-                let value = values.read(ix)?;
+            let values = values.shared_values();
+            for &value in values.iter() {
                 if value < 0. || value > 1. {
                     valid = false;
                     break;
@@ -88,41 +92,44 @@ fn frequency<E: 'static>(
             };
             if (0..=2).contains(&mode) {
                 let shifted = add(phase, 0.5);
-                for_each_chunk::<E>(destination.len() as i32, execution, |start, count| {
-                    let mut ix = start;
-                    let end = start.wrapping_add(count);
-                    while ix < end {
-                        let value = read(&values, ix)?;
-                        let transformed = if mode == 2 {
-                            add(
-                                div(
-                                    ((f64::from(add(mul(value, rate), shifted))
-                                        * (std::f64::consts::PI * 2.))
-                                        .cos()) as f32,
-                                    2.,
-                                ),
-                                0.5,
-                            )
-                        } else {
-                            let mut v = remainder(
-                                add(mul(value, rate), phase),
-                                if mode == 0 { 1.00001_f32 } else { 1. },
-                            );
-                            if v < 0. {
-                                v = add(v, 1.);
-                            }
-                            if mode == 1 {
-                                if v > 0.5 {
-                                    v = sub(1., v);
+                let values = values.shared_values();
+                destination.with_mut_slice(|pixels| {
+                    for_each_chunk::<E>(pixels.len() as i32, execution, |start, count| {
+                        let mut ix = start;
+                        let end = start.wrapping_add(count);
+                        while ix < end {
+                            let value = read_pixel(&values, ix)?;
+                            let transformed = if mode == 2 {
+                                add(
+                                    div(
+                                        ((f64::from(add(mul(value, rate), shifted))
+                                            * (std::f64::consts::PI * 2.))
+                                            .cos()) as f32,
+                                        2.,
+                                    ),
+                                    0.5,
+                                )
+                            } else {
+                                let mut v = remainder(
+                                    add(mul(value, rate), phase),
+                                    if mode == 0 { 1.00001_f32 } else { 1. },
+                                );
+                                if v < 0. {
+                                    v = add(v, 1.);
                                 }
-                                v = mul(v, 2.);
-                            }
-                            v
-                        };
-                        write(&destination, ix, transformed)?;
-                        ix = ix.wrapping_add(1);
-                    }
-                    Ok(())
+                                if mode == 1 {
+                                    if v > 0.5 {
+                                        v = sub(1., v);
+                                    }
+                                    v = mul(v, 2.);
+                                }
+                                v
+                            };
+                            write_pixel(pixels, ix, transformed)?;
+                            ix = ix.wrapping_add(1);
+                        }
+                        Ok(())
+                    })
                 })?;
             }
             output.seal_channel(channel)?;
@@ -143,7 +150,7 @@ struct Octave<'a> {
     scale: f32,
     ratio: f32,
     amplitude: f32,
-    source: &'a FloatBuffer,
+    source: &'a [f32],
     destination: &'a FloatBuffer,
 }
 fn wrap(value: f32, extent: f32) -> f32 {
@@ -167,79 +174,82 @@ impl Octave<'_> {
             if row % 32 == 0 {
                 super::check_render_cancelled(cancelled)?;
             }
-            let target_row = row.wrapping_mul(self.width);
-            let (mut x, fixed_x) = if self.rotation == 2 {
-                (row.wrapping_neg() as f32, true)
-            } else if self.rotation == 6 {
-                (row as f32, true)
-            } else {
-                (0., false)
-            };
-            let (mut y, fixed_y) = if self.rotation == 0 {
-                (row as f32, true)
-            } else if self.rotation == 4 {
-                (row.wrapping_neg() as f32, true)
-            } else {
-                (0., false)
-            };
-            if fixed_x {
-                x = wrap(mul(x, mul(self.scale, self.ratio)), self.source_size[0]);
-            }
-            if fixed_y {
-                y = wrap(mul(y, mul(self.scale, self.ratio)), self.source_size[1]);
-            }
-            let mut column = 0;
-            while column < self.width {
-                match self.rotation {
-                    0 => x = column as f32,
-                    1 => {
-                        x = mul(column.wrapping_sub(row) as f32, 0.5);
-                        y = mul(column.wrapping_add(row) as f32, 0.5);
-                    }
-                    2 => y = column as f32,
-                    3 => {
-                        x = mul(column.wrapping_neg().wrapping_sub(row) as f32, 0.5);
-                        y = mul(column.wrapping_sub(row) as f32, 0.5);
-                    }
-                    4 => x = column.wrapping_neg() as f32,
-                    5 => {
-                        x = mul(column.wrapping_neg().wrapping_add(row) as f32, 0.5);
-                        y = mul(column.wrapping_neg().wrapping_sub(row) as f32, 0.5);
-                    }
-                    6 => y = column.wrapping_neg() as f32,
-                    _ => {
-                        x = mul(column.wrapping_add(row) as f32, 0.5);
-                        y = mul(column.wrapping_neg().wrapping_add(row) as f32, 0.5);
-                    }
-                }
-                if !fixed_x {
+            self.destination.with_mut_slice(|pixels| {
+                let target_row = row.wrapping_mul(self.width);
+                let (mut x, fixed_x) = if self.rotation == 2 {
+                    (row.wrapping_neg() as f32, true)
+                } else if self.rotation == 6 {
+                    (row as f32, true)
+                } else {
+                    (0., false)
+                };
+                let (mut y, fixed_y) = if self.rotation == 0 {
+                    (row as f32, true)
+                } else if self.rotation == 4 {
+                    (row.wrapping_neg() as f32, true)
+                } else {
+                    (0., false)
+                };
+                if fixed_x {
                     x = wrap(mul(x, mul(self.scale, self.ratio)), self.source_size[0]);
                 }
-                if !fixed_y {
+                if fixed_y {
                     y = wrap(mul(y, mul(self.scale, self.ratio)), self.source_size[1]);
                 }
-                let sx = integer(f64::from(x));
-                let sy = integer(f64::from(y));
-                let value = read(
-                    self.source,
-                    sx.wrapping_add(sy.wrapping_mul(self.source_width)),
-                )?;
-                let target = column.wrapping_add(target_row);
-                let current = read(self.destination, target)?;
-                let contribution = mul(value, self.amplitude);
-                write(
-                    self.destination,
-                    target,
-                    if self.blend {
-                        add(current, contribution)
-                    } else if current > contribution {
-                        current
-                    } else {
-                        contribution
-                    },
-                )?;
-                column = column.wrapping_add(1);
-            }
+                let mut column = 0;
+                while column < self.width {
+                    match self.rotation {
+                        0 => x = column as f32,
+                        1 => {
+                            x = mul(column.wrapping_sub(row) as f32, 0.5);
+                            y = mul(column.wrapping_add(row) as f32, 0.5);
+                        }
+                        2 => y = column as f32,
+                        3 => {
+                            x = mul(column.wrapping_neg().wrapping_sub(row) as f32, 0.5);
+                            y = mul(column.wrapping_sub(row) as f32, 0.5);
+                        }
+                        4 => x = column.wrapping_neg() as f32,
+                        5 => {
+                            x = mul(column.wrapping_neg().wrapping_add(row) as f32, 0.5);
+                            y = mul(column.wrapping_neg().wrapping_sub(row) as f32, 0.5);
+                        }
+                        6 => y = column.wrapping_neg() as f32,
+                        _ => {
+                            x = mul(column.wrapping_add(row) as f32, 0.5);
+                            y = mul(column.wrapping_neg().wrapping_add(row) as f32, 0.5);
+                        }
+                    }
+                    if !fixed_x {
+                        x = wrap(mul(x, mul(self.scale, self.ratio)), self.source_size[0]);
+                    }
+                    if !fixed_y {
+                        y = wrap(mul(y, mul(self.scale, self.ratio)), self.source_size[1]);
+                    }
+                    let sx = integer(f64::from(x));
+                    let sy = integer(f64::from(y));
+                    let value = read_pixel(
+                        self.source,
+                        sx.wrapping_add(sy.wrapping_mul(self.source_width)),
+                    )?;
+                    let target = column.wrapping_add(target_row);
+                    let current = read_pixel(pixels, target)?;
+                    let contribution = mul(value, self.amplitude);
+                    write_pixel(
+                        pixels,
+                        target,
+                        if self.blend {
+                            add(current, contribution)
+                        } else if current > contribution {
+                            current
+                        } else {
+                            contribution
+                        },
+                    )?;
+                    column = column.wrapping_add(1);
+                }
+                Ok::<(), PointwiseError<E>>(())
+            })?;
             row = row.wrapping_add(1);
         }
         Ok(())
@@ -405,6 +415,7 @@ fn fractalize<E: 'static>(
                 // supplied dimensions; no fabricated host/context is retained.
                 let dimensions = octave_map.geometry();
                 let amplitude = (1. / f64::from(scale_integer).powf(power)) as f32;
+                let source_pixels = octave_values.shared_values();
                 let job = Octave {
                     blend,
                     width: geometry.width(),
@@ -415,7 +426,7 @@ fn fractalize<E: 'static>(
                     scale,
                     ratio,
                     amplitude,
-                    source: &octave_values,
+                    source: &source_pixels,
                     destination: &destination,
                 };
                 for_each_row_chunk::<E>(job.height, execution, |start, count| {

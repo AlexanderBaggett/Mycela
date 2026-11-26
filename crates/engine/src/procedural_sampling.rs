@@ -1,9 +1,13 @@
 //! The four ImageMap resamplers reached by Noise with both flags false, plus
 //! the same Cubic authority reached by Shape resize with half-pixel true.
 //! Periodic boundaries and cubic's distinct edge/interior accumulation orders
-//! follow the selected bodies. Caller arrays stay aliased; no readonly copy.
+//! follow the selected bodies, including the sequential path for aliased arrays.
 use crate::procedural_schedule::{ProceduralExecution, for_each_chunk};
-use crate::{FloatBuffer, ImageError, PointwiseError, framework_cast::integer};
+use crate::{
+    FloatBuffer, ImageError, PointwiseError,
+    framework_cast::integer,
+    image_map::{read_pixel, write_pixel},
+};
 
 pub(crate) fn allocate(count: i32) -> Result<FloatBuffer, ImageError> {
     let count = usize::try_from(count).map_err(|_| ImageError::Overflow)?;
@@ -26,10 +30,6 @@ fn doubles(count: i32) -> Result<Vec<f64>, ImageError> {
 fn read_raw(source: Option<&FloatBuffer>, index: i32) -> Result<f32, ImageError> {
     let source = source.ok_or(ImageError::NullReference)?;
     source.read(usize::try_from(index).map_err(|_| ImageError::Index)?)
-}
-fn read(source: Option<&FloatBuffer>, index: i32) -> Result<f64, ImageError> {
-    // Arithmetic samplers perform conv.r8 after the reached ldelem.r4.
-    Ok(f64::from(read_raw(source, index)?))
 }
 fn write(destination: Option<&FloatBuffer>, index: i32, value: f32) -> Result<(), ImageError> {
     destination.ok_or(ImageError::NullReference)?.write(
@@ -92,8 +92,8 @@ fn row_parameters(mode: i32, y: i32, ratio: f64, height: i32, offset: f64) -> (i
 }
 /// Noise-selected flags: periodic, no half-pixel offset. Unknown numeric choice
 /// performs no worker call and leaves destination untouched. Null/short arrays
-/// fail at the reached read/write, retaining the written prefix. No source array
-/// snapshot or eager shape validation changes that order.
+/// fail at the reached read/write, retaining the written prefix. When source
+/// and destination alias, each read observes the immediately preceding writes.
 ///
 /// The explicit source profile supplies actual nz chunk boundaries and per-bx
 /// scratch lifetime. Chunks execute sequentially; cross-worker alias/error races,
@@ -193,157 +193,218 @@ fn resample<E>(
     if !(0..=3).contains(&mode) {
         return Ok(());
     }
-    let rx = f64::from(sw) / f64::from(dw);
-    let ry = f64::from(sh) / f64::from(dh);
-    // q constructs four real X arrays before z5, even for zero output area.
-    let weights = if mode == 3 {
-        let mut weights = [doubles(dw)?, doubles(dw)?, doubles(dw)?, doubles(dw)?];
-        for x in 0..dw {
-            let mut position = f64::from(x) * rx + offset;
-            if position < 0.0 {
-                position += f64::from(sw);
-            }
-            let fraction = position - f64::from(integer(position));
-            let values = coefficients(-1.0 - fraction);
-            for i in 0..4 {
-                weights[i][x as usize] = values[i];
-            }
-        }
-        Some(weights)
-    } else {
-        None
+    let grid = ResampleGrid {
+        mode,
+        sw,
+        sh,
+        dw,
+        dh,
+        offset,
+        clamp_y,
     };
-    let area = dw.wrapping_mul(dh);
-    for_each_chunk::<E>(area, execution, |start, count| {
-        let mut y = start.checked_div(dw).ok_or(if dw == 0 {
-            PointwiseError::DivideByZero
-        } else {
-            PointwiseError::Image(ImageError::Overflow)
-        })?;
-        let mut x = start.checked_rem(dw).ok_or(if dw == 0 {
-            PointwiseError::DivideByZero
-        } else {
-            PointwiseError::Image(ImageError::Overflow)
-        })?;
-        // q bx allocates both scratch arrays, even when its loop has no iterations.
-        let mut wy = if mode == 3 { Some(doubles(4)?) } else { None };
-        let mut edge_x = if mode == 3 { Some(doubles(4)?) } else { None };
-        let mut row = if mode == 0 {
-            (0, 0, 0.0)
-        } else {
-            row_parameters(mode, y, ry, sh, offset)
-        };
-        if let Some(wy) = wy.as_mut() {
-            let values = coefficients(row.2 - 2.0);
-            for i in 0..4 {
-                wy[3 - i] = values[i];
-            }
-        }
-        for index in start..start.wrapping_add(count) {
-            if x >= dw {
-                x = 0;
-                y = y.wrapping_add(1);
-                if mode != 0 {
-                    row = row_parameters(mode, y, ry, sh, offset);
-                }
-                if let Some(wy) = wy.as_mut() {
-                    let values = coefficients(row.2 - 2.0);
-                    for i in 0..4 {
-                        wy[3 - i] = values[i];
-                    }
-                }
-            }
-            let value = if mode == 0 {
-                read_raw(
-                    source,
-                    at(integer(f64::from(x) * rx), integer(f64::from(y) * ry), sw),
-                )?
-            } else {
-                let (sy, ny, fy) = row;
+    if let (Some(source), Some(destination)) = (source, destination)
+        && !source.shares_storage(destination)
+    {
+        let source = source.shared_values();
+        destination.with_mut_slice(|pixels| {
+            grid.render(
+                execution,
+                |index| read_pixel(&source, index),
+                |index, value| write_pixel(pixels, index, value),
+            )
+        })
+    } else {
+        // Same-array resampling can read pixels written earlier in this pass.
+        // Preserve that behavior and the reached errors for null arrays.
+        grid.render(
+            execution,
+            |index| read_raw(source, index),
+            |index, value| write(destination, index, value),
+        )
+    }
+}
+
+struct ResampleGrid {
+    mode: i32,
+    sw: i32,
+    sh: i32,
+    dw: i32,
+    dh: i32,
+    offset: f64,
+    clamp_y: bool,
+}
+
+impl ResampleGrid {
+    fn render<E>(
+        self,
+        execution: ProceduralExecution,
+        read_raw: impl Fn(i32) -> Result<f32, ImageError>,
+        mut write: impl FnMut(i32, f32) -> Result<(), ImageError>,
+    ) -> Result<(), PointwiseError<E>> {
+        // Arithmetic samplers perform conv.r8 after the reached ldelem.r4.
+        let read = |index| read_raw(index).map(f64::from);
+        let Self {
+            mode,
+            sw,
+            sh,
+            dw,
+            dh,
+            offset,
+            clamp_y,
+        } = self;
+        let rx = f64::from(sw) / f64::from(dw);
+        let ry = f64::from(sh) / f64::from(dh);
+        // q constructs four real X arrays before z5, even for zero output area.
+        let weights = if mode == 3 {
+            let mut weights = [doubles(dw)?, doubles(dw)?, doubles(dw)?, doubles(dw)?];
+            for x in 0..dw {
                 let mut position = f64::from(x) * rx + offset;
                 if position < 0.0 {
                     position += f64::from(sw);
                 }
-                let sx = integer(position);
-                if mode == 3 {
-                    let weights = weights.as_ref().ok_or(ImageError::NullReference)?;
-                    let wy = wy.as_ref().ok_or(ImageError::NullReference)?;
-                    let edge_x = edge_x.as_mut().ok_or(ImageError::NullReference)?;
-                    let wx = [
-                        weights[0][x as usize],
-                        weights[1][x as usize],
-                        weights[2][x as usize],
-                        weights[3][x as usize],
-                    ];
-                    let ey = sy < 1 || sy >= sh.wrapping_sub(2);
-                    let ex = sx < 1 || sx >= sw.wrapping_sub(2);
-                    let mut sum = 0.0;
-                    if ey || ex {
-                        if ex {
-                            edge_x.copy_from_slice(&wx);
+                let fraction = position - f64::from(integer(position));
+                let values = coefficients(-1.0 - fraction);
+                for i in 0..4 {
+                    weights[i][x as usize] = values[i];
+                }
+            }
+            Some(weights)
+        } else {
+            None
+        };
+        let area = dw.wrapping_mul(dh);
+        for_each_chunk::<E>(area, execution, |start, count| {
+            let mut y = start.checked_div(dw).ok_or(if dw == 0 {
+                PointwiseError::DivideByZero
+            } else {
+                PointwiseError::Image(ImageError::Overflow)
+            })?;
+            let mut x = start.checked_rem(dw).ok_or(if dw == 0 {
+                PointwiseError::DivideByZero
+            } else {
+                PointwiseError::Image(ImageError::Overflow)
+            })?;
+            // q bx allocates both scratch arrays, even when its loop has no iterations.
+            let mut wy = if mode == 3 { Some(doubles(4)?) } else { None };
+            let mut edge_x = if mode == 3 { Some(doubles(4)?) } else { None };
+            let mut row = if mode == 0 {
+                (0, 0, 0.0)
+            } else {
+                row_parameters(mode, y, ry, sh, offset)
+            };
+            if let Some(wy) = wy.as_mut() {
+                let values = coefficients(row.2 - 2.0);
+                for i in 0..4 {
+                    wy[3 - i] = values[i];
+                }
+            }
+            for index in start..start.wrapping_add(count) {
+                if x >= dw {
+                    x = 0;
+                    y = y.wrapping_add(1);
+                    if mode != 0 {
+                        row = row_parameters(mode, y, ry, sh, offset);
+                    }
+                    if let Some(wy) = wy.as_mut() {
+                        let values = coefficients(row.2 - 2.0);
+                        for i in 0..4 {
+                            wy[3 - i] = values[i];
                         }
-                        for dy in -1i32..=2 {
-                            let row = sy.wrapping_add(dy);
-                            let offset = (if clamp_y {
-                                if row >= sh {
-                                    sh.wrapping_sub(1)
-                                } else if row < 0 {
-                                    0
-                                } else {
-                                    row
-                                }
-                            } else {
-                                periodic::<E>(row, sh)?
-                            })
-                            .wrapping_mul(sw);
-                            let weight_y = wy[(dy + 1) as usize];
+                    }
+                }
+                let value = if mode == 0 {
+                    read_raw(at(
+                        integer(f64::from(x) * rx),
+                        integer(f64::from(y) * ry),
+                        sw,
+                    ))?
+                } else {
+                    let (sy, ny, fy) = row;
+                    let mut position = f64::from(x) * rx + offset;
+                    if position < 0.0 {
+                        position += f64::from(sw);
+                    }
+                    let sx = integer(position);
+                    if mode == 3 {
+                        let weights = weights.as_ref().ok_or(ImageError::NullReference)?;
+                        let wy = wy.as_ref().ok_or(ImageError::NullReference)?;
+                        let edge_x = edge_x.as_mut().ok_or(ImageError::NullReference)?;
+                        let wx = [
+                            weights[0][x as usize],
+                            weights[1][x as usize],
+                            weights[2][x as usize],
+                            weights[3][x as usize],
+                        ];
+                        let ey = sy < 1 || sy >= sh.wrapping_sub(2);
+                        let ex = sx < 1 || sx >= sw.wrapping_sub(2);
+                        let mut sum = 0.0;
+                        if ey || ex {
                             if ex {
-                                for dx in -1i32..=2 {
-                                    let column = periodic::<E>(sx.wrapping_add(dx), sw)?;
-                                    sum += read(source, column.wrapping_add(offset))?
-                                        * edge_x[(dx + 1) as usize]
+                                edge_x.copy_from_slice(&wx);
+                            }
+                            for dy in -1i32..=2 {
+                                let row = sy.wrapping_add(dy);
+                                let offset = (if clamp_y {
+                                    if row >= sh {
+                                        sh.wrapping_sub(1)
+                                    } else if row < 0 {
+                                        0
+                                    } else {
+                                        row
+                                    }
+                                } else {
+                                    periodic::<E>(row, sh)?
+                                })
+                                .wrapping_mul(sw);
+                                let weight_y = wy[(dy + 1) as usize];
+                                if ex {
+                                    for dx in -1i32..=2 {
+                                        let column = periodic::<E>(sx.wrapping_add(dx), sw)?;
+                                        sum += read(column.wrapping_add(offset))?
+                                            * edge_x[(dx + 1) as usize]
+                                            * weight_y;
+                                    }
+                                } else {
+                                    let p = sx.wrapping_add(offset);
+                                    sum += (read(p.wrapping_sub(1))? * wx[0]
+                                        + read(p)? * wx[1]
+                                        + read(p.wrapping_add(1))? * wx[2]
+                                        + read(p.wrapping_add(2))? * wx[3])
                                         * weight_y;
                                 }
-                            } else {
-                                let p = sx.wrapping_add(offset);
-                                sum += (read(source, p.wrapping_sub(1))? * wx[0]
-                                    + read(source, p)? * wx[1]
-                                    + read(source, p.wrapping_add(1))? * wx[2]
-                                    + read(source, p.wrapping_add(2))? * wx[3])
-                                    * weight_y;
+                            }
+                        } else {
+                            for dy in -1i32..=2 {
+                                let p = at(sx, sy.wrapping_add(dy), sw);
+                                sum += (read(p.wrapping_sub(1))? * wx[0]
+                                    + read(p)? * wx[1]
+                                    + read(p.wrapping_add(1))? * wx[2]
+                                    + read(p.wrapping_add(2))? * wx[3])
+                                    * wy[(dy + 1) as usize];
                             }
                         }
+                        sum as f32
                     } else {
-                        for dy in -1i32..=2 {
-                            let p = at(sx, sy.wrapping_add(dy), sw);
-                            sum += (read(source, p.wrapping_sub(1))? * wx[0]
-                                + read(source, p)? * wx[1]
-                                + read(source, p.wrapping_add(1))? * wx[2]
-                                + read(source, p.wrapping_add(2))? * wx[3])
-                                * wy[(dy + 1) as usize];
+                        let mut fraction = position - f64::from(sx);
+                        if mode == 2 {
+                            fraction = (1.0 - libm::cos(fraction * std::f64::consts::PI)) / 2.0;
                         }
+                        let mut nx = sx.wrapping_add(1);
+                        if nx >= sw {
+                            nx = nx.wrapping_sub(sw);
+                        }
+                        (read(at(sx, sy, sw))? * (1.0 - fraction) * (1.0 - fy)
+                            + read(at(sx, ny, sw))? * (1.0 - fraction) * fy
+                            + read(at(nx, sy, sw))? * fraction * (1.0 - fy)
+                            + read(at(nx, ny, sw))? * fraction * fy) as f32
                     }
-                    sum as f32
-                } else {
-                    let mut fraction = position - f64::from(sx);
-                    if mode == 2 {
-                        fraction = (1.0 - libm::cos(fraction * std::f64::consts::PI)) / 2.0;
-                    }
-                    let mut nx = sx.wrapping_add(1);
-                    if nx >= sw {
-                        nx = nx.wrapping_sub(sw);
-                    }
-                    (read(source, at(sx, sy, sw))? * (1.0 - fraction) * (1.0 - fy)
-                        + read(source, at(sx, ny, sw))? * (1.0 - fraction) * fy
-                        + read(source, at(nx, sy, sw))? * fraction * (1.0 - fy)
-                        + read(source, at(nx, ny, sw))? * fraction * fy) as f32
-                }
-            };
-            write(destination, index, value)?;
-            x = x.wrapping_add(1);
-        }
-        Ok(())
-    })
+                };
+                write(index, value)?;
+                x = x.wrapping_add(1);
+            }
+            Ok(())
+        })
+    }
 }
 
 #[cfg(test)]

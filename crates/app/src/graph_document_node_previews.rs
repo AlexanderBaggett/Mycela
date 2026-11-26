@@ -8,12 +8,15 @@ use mycela_engine::{
 };
 use std::{
     collections::{HashMap, HashSet},
+    future::{Future, poll_fn},
+    pin::Pin,
+    task::Poll,
     time::Instant,
 };
 
 const THUMBNAIL_SIZE: i32 = 168;
 const PREVIEW_FPS: f64 = 7.;
-const FIRST_FRAME_BATCH: usize = 4;
+const MAX_PREVIEW_WORKERS: usize = 4;
 const OFFSCREEN_FRAME_BUDGET: usize =
     64 * 1024 * 1024 / (4 * THUMBNAIL_SIZE as usize * THUMBNAIL_SIZE as usize);
 const OFFSCREEN_CARD_LIMIT: usize = 256;
@@ -48,6 +51,7 @@ pub(super) struct NodePreviews {
     images: HashMap<u64, CachedPreview>,
     raster_cache: Option<PointwiseThumbnailCache>,
     ticket: Option<Ticket>,
+    active_cards: HashMap<u64, Ticket>,
     job: Option<Task<()>>,
     playback: Option<(Instant, Task<()>)>,
     paused: bool,
@@ -93,28 +97,113 @@ enum Work {
         batches: Vec<CaptureBatch>,
         time: f64,
     },
-    Animation {
-        id: u64,
-        index: usize,
-        pending: Option<Result<CaptureBatch, String>>,
-    },
+    Animation(Vec<AnimationSample>),
+}
+
+struct AnimationSample {
+    worker: usize,
+    id: u64,
+    index: usize,
+    pending: Option<Result<CaptureBatch, String>>,
+}
+
+#[derive(Clone)]
+struct ThumbnailSlots {
+    capacity: usize,
+    free: async_channel::Receiver<()>,
+    give_back: async_channel::Sender<()>,
+}
+
+impl gpui_kit::Global for ThumbnailSlots {}
+
+impl ThumbnailSlots {
+    fn in_app(cx: &mut App) -> Self {
+        if let Some(existing) = cx.try_global::<Self>() {
+            return existing.clone();
+        }
+        // Reserve one logical core for the editor and the selected preview.
+        let cores = std::thread::available_parallelism().map_or(1, usize::from);
+        let capacity = cores.saturating_sub(1).clamp(1, MAX_PREVIEW_WORKERS);
+        let slots = Self::new(capacity);
+        cx.set_global(slots.clone());
+        slots
+    }
+
+    fn new(capacity: usize) -> Self {
+        let (give_back, free) = async_channel::bounded(capacity);
+        for _ in 0..capacity {
+            give_back.try_send(()).expect("an available thumbnail slot");
+        }
+        Self {
+            capacity,
+            free,
+            give_back,
+        }
+    }
+
+    async fn acquire(&self) -> ThumbnailPermit<'_> {
+        self.free.recv().await.expect("thumbnail slots stay open");
+        ThumbnailPermit(&self.give_back)
+    }
+}
+
+struct ThumbnailPermit<'a>(&'a async_channel::Sender<()>);
+
+impl Drop for ThumbnailPermit<'_> {
+    fn drop(&mut self) {
+        let _ = self.0.try_send(());
+    }
 }
 
 struct ThumbnailWorker {
     cache: PointwiseThumbnailCache,
     devices: crate::scene_backend::PreviewDevices,
-    animation: Option<(u64, PointwiseThumbnailRender<ForegroundError>)>,
+    animation: Option<(u64, Thumbnail)>,
+}
+
+struct ThumbnailCancellation {
+    generation: Ticket,
+    card: Ticket,
+}
+
+impl ThumbnailCancellation {
+    fn is_cancelled(&self) -> bool {
+        !self.generation.is_current() || !self.card.is_current()
+    }
+}
+
+type CardImages = Result<Vec<Arc<RenderImage>>, String>;
+
+struct CompletedSample {
+    worker: usize,
+    state: ThumbnailWorker,
+    id: u64,
+    index: usize,
+    first: Option<(bool, u64)>,
+    image: Option<CardImages>,
+}
+
+async fn next_sample(tasks: &mut Vec<Task<CompletedSample>>) -> Option<CompletedSample> {
+    poll_fn(|cx| {
+        for (index, task) in tasks.iter_mut().enumerate() {
+            if let Poll::Ready(sample) = Pin::new(task).poll(cx) {
+                drop(tasks.swap_remove(index));
+                return Poll::Ready(Some(sample));
+            }
+        }
+        if tasks.is_empty() {
+            Poll::Ready(None)
+        } else {
+            Poll::Pending
+        }
+    })
+    .await
 }
 
 impl ThumbnailWorker {
-    fn new(cache: Option<PointwiseThumbnailCache>) -> Self {
+    fn new(cache: PointwiseThumbnailCache) -> Self {
         Self {
-            cache: cache.unwrap_or_else(|| {
-                PointwiseThumbnailCache::new(
-                    ImageGeometry::new(THUMBNAIL_SIZE, THUMBNAIL_SIZE),
-                    crate::scene_backend::GRAPH_PNG_OPTIONS,
-                )
-            }),
+            cache,
             devices: Default::default(),
             animation: None,
         }
@@ -125,16 +214,16 @@ impl ThumbnailWorker {
         renderer: &PointwiseThumbnailRender<ForegroundError>,
         time: f64,
         animated: bool,
-        ticket: &Ticket,
+        cancelled: &ThumbnailCancellation,
         library: &EnvironmentResourceLibrary,
     ) -> Result<Vec<Arc<RenderImage>>, String> {
         let images = crate::scene_backend::render_thumbnail_sample(
             renderer,
             time,
             animated,
-            &mut self.cache,
+            &self.cache,
             &mut self.devices,
-            &|| !ticket.is_current(),
+            &|| cancelled.is_cancelled(),
             library,
         )
         .map_err(model::failure)?;
@@ -146,10 +235,11 @@ impl ThumbnailWorker {
         thumbnail: Result<Thumbnail, String>,
         time: f64,
         animated: bool,
-        ticket: &Ticket,
+        cancelled: &ThumbnailCancellation,
         library: &EnvironmentResourceLibrary,
     ) -> Result<Vec<Arc<RenderImage>>, String> {
-        self.render(&thumbnail?, time, animated, ticket, library)
+        self.animation = None;
+        self.render(&thumbnail?, time, animated, cancelled, library)
     }
 
     fn animation_frame(
@@ -157,7 +247,7 @@ impl ThumbnailWorker {
         id: u64,
         index: usize,
         pending: Option<Result<CaptureBatch, String>>,
-        ticket: &Ticket,
+        cancelled: &ThumbnailCancellation,
         library: &EnvironmentResourceLibrary,
     ) -> Result<Vec<Arc<RenderImage>>, String> {
         let renderer = if let Some(pending) = pending {
@@ -178,7 +268,7 @@ impl ThumbnailWorker {
                 .ok_or("Animation render state was retired.")?
         };
         let time = index as f64 / RenderedImage::PREVIEW_FRAME_COUNT as f64;
-        let image = self.render(&renderer, time, true, ticket, library);
+        let image = self.render(&renderer, time, true, cancelled, library);
         self.animation = Some((id, renderer));
         image
     }
@@ -215,6 +305,9 @@ impl NodePreviews {
     fn cancel(&mut self) {
         if let Some(ticket) = self.ticket.take() {
             ticket.retire();
+        }
+        for (_, card) in self.active_cards.drain() {
+            card.retire();
         }
         self.job.take();
     }
@@ -305,7 +398,7 @@ impl NodePreviews {
         })
     }
 
-    fn next_work(&mut self, animation_owner: Option<u64>) -> Option<Work> {
+    fn next_work(&mut self, animation_owners: &[Option<u64>]) -> Option<Work> {
         let scope = self.scope.as_ref()?;
         let mut first = self
             .visible_nodes
@@ -316,7 +409,7 @@ impl NodePreviews {
                     .get(&node.occurrence_id())
                     .is_some_and(|image| image.generation == self.generation)
             })
-            .take(FIRST_FRAME_BATCH)
+            .take(animation_owners.len())
             .map(|node| {
                 let animated = scope.animate && node.has_animated_preview().unwrap_or(false);
                 (node.occurrence_id(), animated, node.clone())
@@ -343,16 +436,42 @@ impl NodePreviews {
             };
             return Some(Work::FirstFrames { batches, time });
         }
-        self.visible_nodes.iter().find_map(|node| {
-            let id = node.occurrence_id();
-            let image = self.images.get(&id)?;
-            (!image.complete).then(|| Work::Animation {
-                id,
-                index: image.frames.len(),
-                pending: (animation_owner != Some(id))
-                    .then(|| capture_first_frames(&[(id, true, node.clone())], scope.time)),
+        let samples = self
+            .visible_nodes
+            .iter()
+            .filter_map(|node| {
+                let id = node.occurrence_id();
+                let image = self.images.get(&id)?;
+                (!image.complete).then_some((id, image.frames.len(), node))
             })
-        })
+            .take(animation_owners.len())
+            .collect::<Vec<_>>();
+        if samples.is_empty() {
+            return None;
+        }
+        let mut unused = animation_owners
+            .iter()
+            .enumerate()
+            .filter_map(|(index, owner)| {
+                (!samples.iter().any(|(id, _, _)| Some(*id) == *owner)).then_some(index)
+            });
+        Some(Work::Animation(
+            samples
+                .iter()
+                .map(|&(id, index, node)| {
+                    let previous = animation_owners.iter().position(|owner| *owner == Some(id));
+                    AnimationSample {
+                        worker: previous
+                            .unwrap_or_else(|| unused.next().expect("available thumbnail worker")),
+                        id,
+                        index,
+                        pending: previous
+                            .is_none()
+                            .then(|| capture_first_frames(&[(id, true, node.clone())], scope.time)),
+                    }
+                })
+                .collect(),
+        ))
     }
 
     fn publish(
@@ -443,6 +562,13 @@ impl GraphDocumentView {
                     image.last_visible = previews.viewport;
                 }
             }
+            previews.active_cards.retain(|id, ticket| {
+                let visible = ids.contains(id);
+                if !visible {
+                    ticket.retire();
+                }
+                visible
+            });
             previews.visible_nodes = nodes;
             previews.visible_ids = ids;
             previews.prune();
@@ -472,6 +598,23 @@ impl GraphDocumentView {
             })
     }
 
+    fn begin_thumbnail_sample(
+        &mut self,
+        generation: &Ticket,
+        id: u64,
+    ) -> Option<ThumbnailCancellation> {
+        if !self.thumbnail_job_current(generation) || !self.node_previews.visible_ids.contains(&id)
+        {
+            return None;
+        }
+        let card = Ticket::new();
+        self.node_previews.active_cards.insert(id, card.clone());
+        Some(ThumbnailCancellation {
+            generation: generation.clone(),
+            card,
+        })
+    }
+
     fn render_node_previews(&mut self, generation: u64, cx: &mut Context<Self>) {
         let previews = &mut self.node_previews;
         if self.closed
@@ -484,128 +627,171 @@ impl GraphDocumentView {
         }
         let ticket = Ticket::new();
         previews.ticket = Some(ticket.clone());
-        let background = cx.background_executor().clone();
+        let raster_cache = previews.raster_cache.take().unwrap_or_else(|| {
+            PointwiseThumbnailCache::new(
+                ImageGeometry::new(THUMBNAIL_SIZE, THUMBNAIL_SIZE),
+                crate::scene_backend::GRAPH_PNG_OPTIONS,
+            )
+        });
         let library = self.environment_library.clone();
-        let raster_cache = previews.raster_cache.take();
-        previews.job = Some(cx.spawn(async move |owner, cx| {
-            let mut worker = ThumbnailWorker::new(raster_cache);
+        let slots = ThumbnailSlots::in_app(cx);
+        let background = cx.background_executor().clone();
+        self.node_previews.job = Some(cx.spawn(async move |owner, cx| {
+            let mut workers = (0..slots.capacity)
+                .map(|_| Some(ThumbnailWorker::new(raster_cache.clone())))
+                .collect::<Vec<_>>();
             loop {
+                let owners = workers
+                    .iter()
+                    .map(|worker| {
+                        worker
+                            .as_ref()
+                            .and_then(|worker| worker.animation.as_ref().map(|(id, _)| *id))
+                    })
+                    .collect::<Vec<_>>();
                 let Ok(work) = owner.update(cx, |view, _| {
-                    if !view.thumbnail_job_current(&ticket) {
-                        return None;
-                    }
-                    view.node_previews
-                        .next_work(worker.animation.as_ref().map(|(id, _)| *id))
+                    view.thumbnail_job_current(&ticket)
+                        .then(|| view.node_previews.next_work(&owners))
+                        .flatten()
                 }) else {
                     break;
                 };
                 let Some(work) = work else { break };
+                let mut running = Vec::with_capacity(workers.len());
                 match work {
                     Work::FirstFrames { batches, time } => {
-                        for batch in batches {
-                            // The detached batch shares upstream owners and
-                            // materializes any backing files once.
-                            let snapshots = background
-                                .spawn(async move {
-                                    let prepared =
-                                        batch.frozen.materialize().map_err(model::failure);
-                                    batch
-                                        .nodes
-                                        .into_iter()
-                                        .map(|card| {
-                                            let frame = match &prepared {
-                                                Ok(batch) => card
-                                                    .pending
-                                                    .complete(batch)
-                                                    .map_err(model::failure),
-                                                Err(error) => Err(error.clone()),
-                                            };
-                                            (card.id, card.animated, card.node_revision, frame)
-                                        })
-                                        .collect::<Vec<_>>()
-                                })
-                                .await;
-                            for (id, animated, node_revision, frame) in snapshots {
-                                let Ok(current) = owner.update(cx, |view, _| {
-                                    view.thumbnail_job_current(&ticket)
-                                        && view.node_previews.visible_ids.contains(&id)
-                                }) else {
-                                    return;
-                                };
-                                if !current {
-                                    continue;
-                                }
-                                let cancelled = ticket.clone();
-                                let library = library.clone();
-                                let result;
-                                (worker, result) = background
-                                    .spawn(async move {
-                                        let result = worker.first_frame(
-                                            frame,
-                                            if animated { 0. } else { time },
-                                            animated,
-                                            &cancelled,
-                                            &library,
-                                        );
-                                        (worker, result)
-                                    })
-                                    .await;
-                                if owner
-                                    .update(cx, |view, cx| {
-                                        view.publish_thumbnail(
-                                            &ticket,
-                                            id,
-                                            0,
-                                            Some((animated, node_revision)),
-                                            result,
-                                            cx,
-                                        )
-                                    })
-                                    .is_err()
-                                {
-                                    return;
-                                }
-                            }
-                        }
-                    }
-                    Work::Animation { id, index, pending } => {
-                        let cancelled = ticket.clone();
-                        let library = library.clone();
-                        let result;
-                        (worker, result) = background
+                        let snapshots = background
                             .spawn(async move {
-                                let result = worker
-                                    .animation_frame(id, index, pending, &cancelled, &library);
-                                (worker, result)
+                                let mut frames = Vec::new();
+                                for batch in batches {
+                                    let prepared = Arc::new(
+                                        batch.frozen.materialize().map_err(model::failure),
+                                    );
+                                    frames.extend(
+                                        batch
+                                            .nodes
+                                            .into_iter()
+                                            .map(|card| (prepared.clone(), card)),
+                                    );
+                                }
+                                frames
                             })
                             .await;
-                        if owner
-                            .update(cx, |view, cx| {
-                                view.publish_thumbnail(&ticket, id, index, None, result, cx)
-                            })
-                            .is_err()
+                        for (worker, (batch, card)) in snapshots.into_iter().enumerate() {
+                            let FirstFrame {
+                                id,
+                                animated,
+                                node_revision: revision,
+                                pending,
+                            } = card;
+                            let Ok(Some(cancelled)) = owner
+                                .update(cx, |view, _| view.begin_thumbnail_sample(&ticket, id))
+                            else {
+                                continue;
+                            };
+                            let mut state =
+                                workers[worker].take().expect("available thumbnail worker");
+                            let slots = slots.clone();
+                            let library = library.clone();
+                            running.push(background.spawn(async move {
+                                let _permit = slots.acquire().await;
+                                let image = (!cancelled.is_cancelled()).then(|| {
+                                    let frame = match batch.as_ref() {
+                                        Ok(batch) => {
+                                            pending.complete(batch).map_err(model::failure)
+                                        }
+                                        Err(error) => Err(error.clone()),
+                                    };
+                                    state.first_frame(
+                                        frame,
+                                        if animated { 0. } else { time },
+                                        animated,
+                                        &cancelled,
+                                        &library,
+                                    )
+                                });
+                                CompletedSample {
+                                    worker,
+                                    state,
+                                    id,
+                                    index: 0,
+                                    first: Some((animated, revision)),
+                                    image: image.filter(|_| !cancelled.is_cancelled()),
+                                }
+                            }));
+                        }
+                    }
+                    Work::Animation(samples) => {
+                        for AnimationSample {
+                            worker,
+                            id,
+                            index,
+                            pending,
+                        } in samples
                         {
-                            return;
+                            let Ok(Some(cancelled)) = owner
+                                .update(cx, |view, _| view.begin_thumbnail_sample(&ticket, id))
+                            else {
+                                continue;
+                            };
+                            let mut state =
+                                workers[worker].take().expect("available thumbnail worker");
+                            let slots = slots.clone();
+                            let library = library.clone();
+                            running.push(background.spawn(async move {
+                                let _permit = slots.acquire().await;
+                                let image = (!cancelled.is_cancelled()).then(|| {
+                                    state.animation_frame(id, index, pending, &cancelled, &library)
+                                });
+                                CompletedSample {
+                                    worker,
+                                    state,
+                                    id,
+                                    index,
+                                    first: None,
+                                    image: image.filter(|_| !cancelled.is_cancelled()),
+                                }
+                            }));
                         }
                     }
                 }
+                while let Some(sample) = next_sample(&mut running).await {
+                    workers[sample.worker] = Some(sample.state);
+                    if owner
+                        .update(cx, |view, cx| {
+                            if view.thumbnail_job_current(&ticket) {
+                                let still_visible = view
+                                    .node_previews
+                                    .active_cards
+                                    .remove(&sample.id)
+                                    .is_some_and(|card| card.is_current());
+                                if still_visible && let Some(image) = sample.image {
+                                    view.publish_thumbnail(
+                                        &ticket,
+                                        sample.id,
+                                        sample.index,
+                                        sample.first,
+                                        image,
+                                        cx,
+                                    );
+                                }
+                            }
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
             }
-            let ThumbnailWorker {
-                cache,
-                devices,
-                animation,
-            } = worker;
             let _ = owner.update(cx, move |view, cx| {
                 if view.thumbnail_job_current(&ticket) {
-                    view.node_previews.raster_cache = Some(cache);
+                    view.node_previews.raster_cache = Some(raster_cache);
                     view.node_previews.ticket.take();
                     view.node_previews.job.take();
                     cx.notify();
                 }
             });
-            background
-                .spawn(async move { drop((devices, animation)) })
-                .detach();
+            background.spawn(async move { drop(workers) }).detach();
         }));
     }
 
@@ -819,5 +1005,30 @@ fn project_thumbnails(images: RenderedImage) -> Result<Vec<Arc<RenderImage>>, St
     match images {
         RenderedImage::Still(image) => Ok(vec![project(&image)?]),
         RenderedImage::Animated(images) => images.iter().map(project).collect(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn concurrent_samples_wait_until_a_worker_releases_its_slot() {
+        use std::{
+            pin::pin,
+            task::{Context as PollContext, Waker},
+        };
+        let slots = ThumbnailSlots::new(2);
+        let first = pollster::block_on(slots.acquire());
+        let second = pollster::block_on(slots.acquire());
+        let mut queued = pin!(slots.acquire());
+        let mut context = PollContext::from_waker(Waker::noop());
+        assert!(queued.as_mut().poll(&mut context).is_pending());
+        drop(first);
+        let Poll::Ready(third) = queued.as_mut().poll(&mut context) else {
+            panic!("slot was not returned");
+        };
+        assert!(pin!(slots.acquire()).poll(&mut context).is_pending());
+        drop((second, third));
     }
 }

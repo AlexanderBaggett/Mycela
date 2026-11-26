@@ -21,6 +21,16 @@ impl FloatStorage {
         }
     }
 
+    fn share_values(&mut self) -> Arc<Vec<f32>> {
+        if let Self::Owned(values) = self {
+            *self = Self::Shared(Arc::new(std::mem::take(values)));
+        }
+        match self {
+            Self::Shared(values) => values.clone(),
+            Self::Owned(_) => unreachable!("shared float values"),
+        }
+    }
+
     fn values_mut(&mut self) -> &mut [f32] {
         match self {
             Self::Owned(values) => values,
@@ -78,6 +88,15 @@ impl FloatBuffer {
         values.values_mut()[index] = value;
         Ok(())
     }
+    /// A read-only view of one plane. A subsequent writer splits the
+    /// backing storage while writable handles still share the same owner.
+    pub(crate) fn shared_values(&self) -> Arc<Vec<f32>> {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .share_values()
+    }
+
     pub(crate) fn with_mut_slice<T>(&self, update: impl FnOnce(&mut [f32]) -> T) -> T {
         let mut values = self.0.lock().unwrap_or_else(|error| error.into_inner());
         update(values.values_mut())
@@ -114,10 +133,12 @@ impl FloatBuffer {
     }
     fn detached_copy(&self, share_backing: bool) -> Self {
         let mut storage = self.0.lock().unwrap_or_else(|error| error.into_inner());
-        if share_backing && let FloatStorage::Owned(values) = &mut *storage {
-            *storage = FloatStorage::Shared(Arc::new(std::mem::take(values)));
-        }
-        Self(Arc::new(Mutex::new(storage.clone())))
+        let backing = if share_backing {
+            FloatStorage::Shared(storage.share_values())
+        } else {
+            storage.clone()
+        };
+        Self(Arc::new(Mutex::new(backing)))
     }
     fn copy_range(&self, start: usize, length: usize) -> Result<Self, ImageError> {
         let mut copy = Vec::new();
@@ -148,6 +169,21 @@ impl FloatBuffer {
             _ => false,
         }
     }
+}
+
+pub(crate) fn read_pixel(values: &[f32], index: i32) -> Result<f32, ImageError> {
+    values
+        .get(usize::try_from(index).map_err(|_| ImageError::Index)?)
+        .copied()
+        .ok_or(ImageError::Index)
+}
+
+pub(crate) fn write_pixel(values: &mut [f32], index: i32, value: f32) -> Result<(), ImageError> {
+    let pixel = values
+        .get_mut(usize::try_from(index).map_err(|_| ImageError::Index)?)
+        .ok_or(ImageError::Index)?;
+    *pixel = value;
+    Ok(())
 }
 
 /// A retained in-memory store, distinct from the float array it owns.
@@ -1183,3 +1219,15 @@ mod store_lifecycle_test;
 #[path = "image_capture.rs"]
 mod capture;
 pub(crate) use capture::{ImageCapture, ImageValues, RawImage};
+
+#[cfg(test)]
+#[test]
+fn a_read_view_keeps_its_pixels_when_a_writable_alias_changes() {
+    let image = FloatBuffer::new(vec![0.25, -0.5]);
+    let alias = image.clone();
+    let original = image.shared_values();
+    assert!(Arc::ptr_eq(&original, &alias.shared_values()));
+    alias.write_block(0, 1, &[3., 4.]).unwrap();
+    assert_eq!(&**original, &[0.25, -0.5]);
+    assert_eq!(image.values(), vec![3., 4.]);
+}

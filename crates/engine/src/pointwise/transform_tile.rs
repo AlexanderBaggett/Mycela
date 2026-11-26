@@ -2,6 +2,7 @@
 use super::numeric::{add, div, mul, sub};
 use super::transform::*;
 use super::{PointwiseError, PointwiseFilter, PointwiseRenderOptions, SharedImageMap};
+use crate::image_map::{read_pixel, write_pixel};
 use crate::{FloatBuffer, ImageError, ImageGeometry, ProceduralExecution, SharedFloatStore};
 #[derive(Clone, Copy)]
 struct Grid {
@@ -100,42 +101,47 @@ fn grid_worker<E>(
     regions: bool,
     execution: ProceduralExecution,
 ) -> Result<(), PointwiseError<E>> {
-    crate::procedural_schedule::for_each_chunk(
-        grid.w.wrapping_mul(grid.h),
-        execution,
-        |start, count| {
-            let mut row = start
-                .checked_div(grid.w)
-                .ok_or(PointwiseError::DivideByZero)?;
-            let mut col = rem(start, grid.w)?;
-            for cell in start..start.wrapping_add(count) {
-                if col >= grid.w {
-                    col = 0;
-                    row = row.wrapping_add(1);
+    let values = values.shared_values();
+    dest.with_mut_slice(|pixels| {
+        crate::procedural_schedule::for_each_chunk(
+            grid.w.wrapping_mul(grid.h),
+            execution,
+            |start, count| {
+                let mut row = start
+                    .checked_div(grid.w)
+                    .ok_or(PointwiseError::DivideByZero)?;
+                let mut col = rem(start, grid.w)?;
+                for cell in start..start.wrapping_add(count) {
+                    if col >= grid.w {
+                        col = 0;
+                        row = row.wrapping_add(1);
+                    }
+                    let (x, y) = grid.coordinates(row, col);
+                    let value = if regions {
+                        let x = rem(cast(f64::from(mul(grid.n as f32, x))), grid.w)? as f32;
+                        let y = rem(cast(f64::from(mul(grid.n as f32, y))), grid.h)? as f32;
+                        read_pixel(
+                            &values,
+                            cast(f64::from(x))
+                                .wrapping_add(cast(f64::from(y)).wrapping_mul(grid.w)),
+                        )?
+                    } else {
+                        super::motion_sampling::sample_pixels(
+                            mul(mul(grid.n as f32, x), scale),
+                            mul(mul(grid.n as f32, y), scale),
+                            &values,
+                            sw,
+                            sh,
+                            true,
+                        )?
+                    };
+                    write_pixel(pixels, cell, value)?;
+                    col = col.wrapping_add(1);
                 }
-                let (x, y) = grid.coordinates(row, col);
-                let value = if regions {
-                    let x = rem(cast(f64::from(mul(grid.n as f32, x))), grid.w)? as f32;
-                    let y = rem(cast(f64::from(mul(grid.n as f32, y))), grid.h)? as f32;
-                    read(
-                        values,
-                        cast(f64::from(x)).wrapping_add(cast(f64::from(y)).wrapping_mul(grid.w)),
-                    )?
-                } else {
-                    sample(
-                        mul(mul(grid.n as f32, x), scale),
-                        mul(mul(grid.n as f32, y), scale),
-                        values,
-                        sw,
-                        sh,
-                    )?
-                };
-                write(dest, cell, value)?;
-                col = col.wrapping_add(1);
-            }
-            Ok(())
-        },
-    )
+                Ok(())
+            },
+        )
+    })
 }
 pub(super) fn retained<E: 'static>(
     f: &PointwiseFilter<E>,

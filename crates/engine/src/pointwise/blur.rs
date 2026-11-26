@@ -6,7 +6,10 @@ use super::{
 };
 use crate::procedural_schedule::{for_each_chunk, for_each_row_chunk};
 use crate::source_float::{first_nan, ordered_add};
-use crate::{FloatBuffer, ImageError, ImageGeometry, ProceduralExecution};
+use crate::{
+    FloatBuffer, ImageError, ImageGeometry, ProceduralExecution,
+    image_map::{read_pixel, write_pixel},
+};
 
 // ki row/column Double products use the same first-NaN selection as the
 // characterized ordered Double accumulator. This is a named worker profile,
@@ -52,12 +55,9 @@ fn copy(source: &FloatBuffer, dest: &FloatBuffer, count: usize) -> Result<(), Im
     if source.len() < count || dest.len() < count {
         return Err(ImageError::Argument);
     }
-    // Actual Array.Copy overlap behavior; source/destination handles survive.
-    let values = source.values();
-    for (i, value) in values.into_iter().take(count).enumerate() {
-        dest.write(i, value)?;
-    }
-    Ok(())
+    // Snapshot the copied cells so overlapping handles remain valid.
+    let values = source.shared_values();
+    dest.write_block(0, 1, &values[..count])
 }
 fn plan(dimension: f64, radius: f64, maximum: i32) -> (i32, i32) {
     let mut passes = maximum;
@@ -159,23 +159,27 @@ fn expansion<E>(
     while ch < input.channel_count()? as i32 {
         let source = input.channel(ch, false)?;
         let dest = out.materialize(ch)?;
+        let source = source.shared_values();
         let dense = source.len() > 1;
-        for_each_row_chunk::<E>(oh, execution, |start, count| {
-            let end = start.wrapping_add(count);
-            let mut y = start;
-            while y < end {
-                let old_row = y.wrapping_mul(ow);
-                let new_row = y.wrapping_add(oy).wrapping_mul(w);
-                let mut x = 0;
-                while x < ow {
-                    let target = x.wrapping_add(ox).wrapping_add(new_row);
-                    let value = read(&source, if dense { x.wrapping_add(old_row) } else { 0 })?;
-                    write(&dest, target, value)?;
-                    x = x.wrapping_add(1);
+        dest.with_mut_slice(|pixels| {
+            for_each_row_chunk::<E>(oh, execution, |start, count| {
+                let end = start.wrapping_add(count);
+                let mut y = start;
+                while y < end {
+                    let old_row = y.wrapping_mul(ow);
+                    let new_row = y.wrapping_add(oy).wrapping_mul(w);
+                    let mut x = 0;
+                    while x < ow {
+                        let target = x.wrapping_add(ox).wrapping_add(new_row);
+                        let value =
+                            read_pixel(&source, if dense { x.wrapping_add(old_row) } else { 0 })?;
+                        write_pixel(pixels, target, value)?;
+                        x = x.wrapping_add(1);
+                    }
+                    y = y.wrapping_add(1);
                 }
-                y = y.wrapping_add(1);
-            }
-            Ok(())
+                Ok(())
+            })
         })?;
         out.seal_channel(ch)?;
         ch = ch.wrapping_add(1);
@@ -188,8 +192,7 @@ enum Axis {
     Column,
 }
 struct LineJob<'a> {
-    source: &'a FloatBuffer,
-    dest: &'a FloatBuffer,
+    source: &'a [f32],
     width: i32,
     height: i32,
     radius: i32,
@@ -204,7 +207,7 @@ impl LineJob<'_> {
             Axis::Column => line.wrapping_add(position.wrapping_mul(self.width)),
         }
     }
-    fn run<E>(&self, start: i32, count: i32) -> Result<(), PointwiseError<E>> {
+    fn run<E>(&self, start: i32, count: i32, pixels: &mut [f32]) -> Result<(), PointwiseError<E>> {
         let extent = match self.axis {
             Axis::Row => self.width,
             Axis::Column => self.height,
@@ -219,20 +222,23 @@ impl LineJob<'_> {
                 while p < extent {
                     let sum = ordered_add(
                         line_read(&sums, 0)?,
-                        f64::from(read(self.source, self.at(line, p))?),
+                        f64::from(read_pixel(self.source, self.at(line, p))?),
                     );
                     line_write(&mut sums, 0, sum)?;
                     p = p.wrapping_add(1);
                 }
             } else {
-                let seed = mul(read(self.source, self.at(line, 0))?, self.radius as f32);
+                let seed = mul(
+                    read_pixel(self.source, self.at(line, 0))?,
+                    self.radius as f32,
+                );
                 line_write(&mut sums, 0, f64::from(seed))?;
             }
             let mut p = 0;
             while p <= self.radius {
                 let sum = ordered_add(
                     line_read(&sums, 0)?,
-                    f64::from(read(self.source, self.at(line, p))?),
+                    f64::from(read_pixel(self.source, self.at(line, p))?),
                 );
                 line_write(&mut sums, 0, sum)?;
                 p = p.wrapping_add(1);
@@ -258,8 +264,8 @@ impl LineJob<'_> {
                     };
                 }
                 // CIL NEG then Single ADD, then conv.r8; never 0f - sample.
-                let negative = -read(self.source, self.at(line, outgoing))?;
-                let delta = add(negative, read(self.source, self.at(line, incoming))?);
+                let negative = -read_pixel(self.source, self.at(line, outgoing))?;
+                let delta = add(negative, read_pixel(self.source, self.at(line, incoming))?);
                 let sum = ordered_add(
                     line_read(&sums, p.wrapping_sub(1))?,
                     box_mul64(f64::from(delta), self.reciprocal),
@@ -269,7 +275,7 @@ impl LineJob<'_> {
             }
             let mut p = 0;
             while p < extent {
-                write(self.dest, self.at(line, p), line_read(&sums, p)? as f32)?;
+                write_pixel(pixels, self.at(line, p), line_read(&sums, p)? as f32)?;
                 p = p.wrapping_add(1);
             }
             line = line.wrapping_add(1);
@@ -333,9 +339,9 @@ fn box_pass<E>(
                 source = a.clone();
             }
             if s.horizontal {
+                let values = source.shared_values();
                 let job = LineJob {
-                    source: &source,
-                    dest: &dest,
+                    source: &values,
                     width: w,
                     height: h,
                     radius: s.radius,
@@ -343,7 +349,12 @@ fn box_pass<E>(
                     periodic: s.periodic,
                     axis: Axis::Row,
                 };
-                for_each_row_chunk::<E>(h, execution, |start, count| job.run::<E>(start, count))?;
+                dest.with_mut_slice(|pixels| {
+                    for_each_row_chunk::<E>(h, execution, |start, count| {
+                        job.run(start, count, pixels)
+                    })
+                })?;
+                drop(values);
                 if s.vertical {
                     if scratch.is_none() {
                         scratch = Some(floats(geometry.area())?);
@@ -354,9 +365,9 @@ fn box_pass<E>(
                 }
             }
             if s.vertical {
+                let values = source.shared_values();
                 let job = LineJob {
-                    source: &source,
-                    dest: &dest,
+                    source: &values,
                     width: w,
                     height: h,
                     radius: s.radius,
@@ -364,7 +375,12 @@ fn box_pass<E>(
                     periodic: s.periodic,
                     axis: Axis::Column,
                 };
-                for_each_row_chunk::<E>(w, execution, |start, count| job.run::<E>(start, count))?;
+                dest.with_mut_slice(|pixels| {
+                    for_each_row_chunk::<E>(w, execution, |start, count| {
+                        job.run(start, count, pixels)
+                    })
+                })?;
+                drop(values);
             }
         }
         input.seal_channel(ch)?;
@@ -441,16 +457,24 @@ fn interpolate<E>(
                 out.set_constant(ch, add(first, second))?;
             } else {
                 let dest = out.materialize(ch)?;
-                for_each_chunk::<E>(a.len() as i32, execution, |start, count| {
-                    let end = start.wrapping_add(count);
-                    let mut i = start;
-                    while i < end {
-                        let first = mul(read(&a, i)?, weight);
-                        let second = mul(read(&b, i)?, other);
-                        write(&dest, i, add(first, second))?;
-                        i = i.wrapping_add(1);
-                    }
-                    Ok(())
+                let count = a.len() as i32;
+                let a = (!a.shares_storage(&dest)).then(|| a.shared_values());
+                let b = (!b.shares_storage(&dest)).then(|| b.shared_values());
+                dest.with_mut_slice(|pixels| {
+                    for_each_chunk::<E>(count, execution, |start, count| {
+                        for i in start..start.wrapping_add(count) {
+                            let first = mul(
+                                read_pixel(a.as_deref().map_or(&*pixels, Vec::as_slice), i)?,
+                                weight,
+                            );
+                            let second = mul(
+                                read_pixel(b.as_deref().map_or(&*pixels, Vec::as_slice), i)?,
+                                other,
+                            );
+                            write_pixel(pixels, i, add(first, second))?;
+                        }
+                        Ok(())
+                    })
                 })?;
             }
         }

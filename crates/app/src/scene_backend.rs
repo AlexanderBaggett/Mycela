@@ -341,7 +341,7 @@ pub(crate) fn render_thumbnail_sample(
     renderer: &mycela_engine::PointwiseThumbnailRender<ForegroundError>,
     time: f64,
     animated: bool,
-    cache: &mut mycela_engine::PointwiseThumbnailCache,
+    cache: &mycela_engine::PointwiseThumbnailCache,
     devices: &mut PreviewDevices,
     cancelled: &impl Fn() -> bool,
     library: &mycela_engine::EnvironmentResourceLibrary,

@@ -1041,7 +1041,7 @@ impl<E: 'static> FinalGraphExecution<'_, E> {
         if let Some(image) = self.images.get(&node.id) {
             return Some(image.clone());
         }
-        let image = match &self.reuse {
+        let image = match &mut self.reuse {
             FinalImageReuse::None => None,
             FinalImageReuse::Original => {
                 self.originals[&node.id].with_final_cache(|cache| cache.read(node.id, geometry))
@@ -1051,11 +1051,8 @@ impl<E: 'static> FinalGraphExecution<'_, E> {
                 .get(&node.id)
                 .filter(|image| image.geometry() == geometry)
                 .map(SharedImageMap::share_pixel_backing),
-            FinalImageReuse::Thumbnail(reuse) => reuse.lookup(self.originals[&node.id].id),
+            FinalImageReuse::Thumbnail(reuse) => reuse.lookup(node.id, self.originals[&node.id].id),
         }?;
-        if let FinalImageReuse::Thumbnail(reuse) = &mut self.reuse {
-            reuse.mark_reused(node.id, self.originals[&node.id].id);
-        }
         self.images.insert(node.id, image.clone());
         Some(image)
     }

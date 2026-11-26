@@ -2,11 +2,7 @@
 //! precedes raw TL/TR/BL/BR loads; zero weights never suppress source reads.
 use super::PointwiseError;
 use super::numeric::{add, mul, sub};
-use crate::{FloatBuffer, ImageError};
-fn read(source: &FloatBuffer, x: i32, y: i32, width: i32) -> Result<f32, ImageError> {
-    let i = x.wrapping_add(y.wrapping_mul(width));
-    source.read(usize::try_from(i).map_err(|_| ImageError::Index)?)
-}
+use crate::{FloatBuffer, ImageError, image_map::read_pixel};
 fn remainder<E>(a: i32, b: i32) -> Result<i32, PointwiseError<E>> {
     a.checked_rem(b).ok_or(if b == 0 {
         PointwiseError::DivideByZero
@@ -50,6 +46,32 @@ pub(super) fn sample<E>(
     height: i32,
     seamless: bool,
 ) -> Result<f32, PointwiseError<E>> {
+    sample_from(x, y, width, height, seamless, |index| {
+        source.read(usize::try_from(index).map_err(|_| ImageError::Index)?)
+    })
+}
+
+pub(super) fn sample_pixels<E>(
+    x: f32,
+    y: f32,
+    source: &[f32],
+    width: i32,
+    height: i32,
+    seamless: bool,
+) -> Result<f32, PointwiseError<E>> {
+    sample_from(x, y, width, height, seamless, |index| {
+        read_pixel(source, index)
+    })
+}
+
+fn sample_from<E>(
+    x: f32,
+    y: f32,
+    width: i32,
+    height: i32,
+    seamless: bool,
+    read: impl Fn(i32) -> Result<f32, ImageError>,
+) -> Result<f32, PointwiseError<E>> {
     let (x0, x1, fx) = if seamless {
         wrapped(x, width)?
     } else {
@@ -60,11 +82,13 @@ pub(super) fn sample<E>(
     } else {
         clamped(y, height)
     };
-    let tl = read(source, x0, y0, width)?;
-    let tr = read(source, x1, y0, width)?;
+    let y0 = y0.wrapping_mul(width);
+    let y1 = y1.wrapping_mul(width);
+    let tl = read(x0.wrapping_add(y0))?;
+    let tr = read(x1.wrapping_add(y0))?;
     let top = add(tl, mul(fx, sub(tr, tl)));
-    let bl = read(source, x0, y1, width)?;
-    let br = read(source, x1, y1, width)?;
+    let bl = read(x0.wrapping_add(y1))?;
+    let br = read(x1.wrapping_add(y1))?;
     let bottom = add(bl, mul(fx, sub(br, bl)));
     Ok(add(top, mul(fy, sub(bottom, top))))
 }

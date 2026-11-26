@@ -3,7 +3,10 @@ use super::numeric::{add, div, mul, sub};
 use super::{
     PointwiseError, PointwiseFilter, PointwiseKind, PointwiseRenderOptions, SharedImageMap,
 };
-use crate::{FloatBuffer, ImageError, ImageGeometry, ProceduralExecution};
+use crate::{
+    FloatBuffer, ImageError, ImageGeometry, ProceduralExecution,
+    image_map::{read_pixel, write_pixel},
+};
 pub(super) fn owns(kind: PointwiseKind) -> bool {
     matches!(
         kind,
@@ -225,38 +228,45 @@ fn remap<E>(
             output.copy_indexed_constant(ch, source.read(0)?, original)?;
         } else {
             let dest = output.allocate_indexed(ch, original)?;
-            crate::procedural_schedule::for_each_chunk::<E>(
-                w.wrapping_mul(h),
-                execution,
-                |start, count| {
-                    let mut row = start.checked_div(w).ok_or(PointwiseError::DivideByZero)?;
-                    let mut col = rem(start, w)?;
-                    let mut px = mul(x.read(0)?, w as f32);
-                    let mut py = mul(y.read(0)?, h as f32);
-                    for _ in start..start.wrapping_add(count) {
-                        if col >= w {
-                            col = 0;
-                            row = row.wrapping_add(1);
+            let source = source.shared_values();
+            let x = x.shared_values();
+            let y = y.shared_values();
+            dest.with_mut_slice(|pixels| {
+                crate::procedural_schedule::for_each_chunk::<E>(
+                    w.wrapping_mul(h),
+                    execution,
+                    |start, count| {
+                        let mut row = start.checked_div(w).ok_or(PointwiseError::DivideByZero)?;
+                        let mut col = rem(start, w)?;
+                        let mut px = mul(read_pixel(&x, 0)?, w as f32);
+                        let mut py = mul(read_pixel(&y, 0)?, h as f32);
+                        for _ in start..start.wrapping_add(count) {
+                            if col >= w {
+                                col = 0;
+                                row = row.wrapping_add(1);
+                            }
+                            let at = col.wrapping_add(row.wrapping_mul(w));
+                            if x.len() > 1 {
+                                px = mul(read_pixel(&x, at)?, w as f32);
+                            }
+                            if y.len() > 1 {
+                                py = mul(read_pixel(&y, at)?, h as f32);
+                            }
+                            if px < 0. {
+                                px = add(px % (w as f32), w as f32);
+                            }
+                            if py < 0. {
+                                py = add(py % (h as f32), h as f32);
+                            }
+                            let value =
+                                super::motion_sampling::sample_pixels(px, py, &source, w, h, true)?;
+                            write_pixel(pixels, at, value)?;
+                            col = col.wrapping_add(1);
                         }
-                        let at = col.wrapping_add(row.wrapping_mul(w));
-                        if x.len() > 1 {
-                            px = mul(read(&x, at)?, w as f32);
-                        }
-                        if y.len() > 1 {
-                            py = mul(read(&y, at)?, h as f32);
-                        }
-                        if px < 0. {
-                            px = add(px % (w as f32), w as f32);
-                        }
-                        if py < 0. {
-                            py = add(py % (h as f32), h as f32);
-                        }
-                        write(&dest, at, sample(px, py, &source, w, h)?)?;
-                        col = col.wrapping_add(1);
-                    }
-                    Ok(())
-                },
-            )?;
+                        Ok(())
+                    },
+                )
+            })?;
         }
         output.seal_channel(ch)?;
     }

@@ -3,17 +3,26 @@ use crate::{
     ImageGeneratorKind, ImageGeometry, PointwiseRenderOptions, SharedImageMap,
     pointwise::region::NodeId,
 };
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::{
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
+    sync::{Arc, Mutex},
+};
 
 const RASTER_BUDGET: usize = 32 * 1024 * 1024;
 type RasterKey = (NodeId, Option<u64>);
 
 /// Shared image intermediates for one captured document revision and resource
 /// configuration. Create a new cache when the graph or its resources change.
+#[derive(Clone)]
 pub struct PointwiseThumbnailCache {
     geometry: ImageGeometry,
     options: PointwiseRenderOptions,
     capacity: usize,
+    rasters: Arc<Mutex<Rasters>>,
+}
+
+#[derive(Default)]
+struct Rasters {
     images: HashMap<RasterKey, SharedImageMap>,
     order: VecDeque<RasterKey>,
 }
@@ -28,8 +37,7 @@ impl PointwiseThumbnailCache {
             geometry,
             options,
             capacity: RASTER_BUDGET.checked_div(bytes).unwrap_or(0).min(4096),
-            images: HashMap::new(),
-            order: VecDeque::new(),
+            rasters: Arc::default(),
         }
     }
 
@@ -41,24 +49,49 @@ impl PointwiseThumbnailCache {
         self.options
     }
 
-    fn insert(&mut self, key: RasterKey, image: &SharedImageMap) {
-        if self.capacity == 0 || self.images.contains_key(&key) {
+    fn insert(&self, key: RasterKey, image: &SharedImageMap) {
+        if self.capacity == 0 {
             return;
         }
-        if self.images.len() == self.capacity
-            && let Some(oldest) = self.order.pop_front()
-        {
-            self.images.remove(&oldest);
+        let image = image.share_pixel_backing();
+        let mut rasters = crate::pointwise::guard(&self.rasters);
+        if rasters.images.contains_key(&key) {
+            return;
         }
-        self.images.insert(key, image.share_pixel_backing());
-        self.order.push_back(key);
+        let displaced = if rasters.images.len() == self.capacity {
+            let oldest = rasters.order.pop_front().expect("cached raster");
+            rasters.images.remove(&oldest)
+        } else {
+            None
+        };
+        rasters.images.insert(key, image);
+        rasters.order.push_back(key);
+        drop(rasters);
+        drop(displaced);
+    }
+
+    fn lookup(&self, origin: NodeId, time: u64) -> Option<(SharedImageMap, bool)> {
+        let cached = {
+            let rasters = crate::pointwise::guard(&self.rasters);
+            rasters
+                .images
+                .get(&(origin, None))
+                .map(|image| (image.clone(), true))
+                .or_else(|| {
+                    rasters
+                        .images
+                        .get(&(origin, Some(time)))
+                        .map(|image| (image.clone(), false))
+                })
+        };
+        cached.map(|(image, is_static)| (image.share_pixel_backing(), is_static))
     }
 }
 
 /// Proof of when a private final occurrence can share its raster with another
 /// card. The cache key uses the original ID, which survives detached captures.
 pub(in crate::pointwise) struct ThumbnailReuse<'a> {
-    cache: &'a mut PointwiseThumbnailCache,
+    cache: &'a PointwiseThumbnailCache,
     origins: &'a BTreeMap<NodeId, NodeId>,
     ambiguous_sources: &'a HashSet<NodeId>,
     time: f64,
@@ -67,7 +100,7 @@ pub(in crate::pointwise) struct ThumbnailReuse<'a> {
 
 impl<'a> ThumbnailReuse<'a> {
     pub(in crate::pointwise) fn new(
-        cache: &'a mut PointwiseThumbnailCache,
+        cache: &'a PointwiseThumbnailCache,
         origins: &'a BTreeMap<NodeId, NodeId>,
         ambiguous_sources: &'a HashSet<NodeId>,
         time: f64,
@@ -88,20 +121,12 @@ impl<'a> ThumbnailReuse<'a> {
         self.origins.get(&source).copied()
     }
 
-    pub(super) fn lookup(&self, source: NodeId) -> Option<SharedImageMap> {
-        let origin = self.origin(source)?;
-        self.cache
-            .images
-            .get(&(origin, None))
-            .or_else(|| self.cache.images.get(&(origin, Some(self.time.to_bits()))))
-            .map(SharedImageMap::share_pixel_backing)
-    }
-
-    pub(super) fn mark_reused(&mut self, node: NodeId, source: NodeId) {
-        if let Some(origin) = self.origin(source) {
-            self.reusable
-                .insert(node, self.cache.images.contains_key(&(origin, None)));
-        }
+    pub(super) fn lookup(&mut self, node: NodeId, source: NodeId) -> Option<SharedImageMap> {
+        let (image, is_static) = self
+            .cache
+            .lookup(self.origin(source)?, self.time.to_bits())?;
+        self.reusable.insert(node, is_static);
+        Some(image)
     }
 
     pub(super) fn record<E: 'static>(
@@ -241,7 +266,7 @@ mod tests {
                 0.,
                 false,
                 execution,
-                &mut PointwiseThumbnailCache::new(geometry, options),
+                &PointwiseThumbnailCache::new(geometry, options),
                 &mut effects,
             )
             .unwrap()
@@ -308,7 +333,7 @@ mod tests {
         let downstream_card = group_frame.clone().prepare_thumbnail().unwrap();
         let geometry = ImageGeometry::new(24, 16);
         let options = PointwiseRenderOptions::new(false, true);
-        let mut cache = PointwiseThumbnailCache::new(geometry, options);
+        let cache = PointwiseThumbnailCache::new(geometry, options);
         let mut capacity = |_| Ok(true);
         let mut preflight = |_, _| Ok(());
         let mut effects = PointwiseRenderEffects::new(&mut capacity, &mut preflight);
@@ -322,24 +347,27 @@ mod tests {
         for index in [0, 13, 31] {
             let time = index as f64 / RenderedImage::PREVIEW_FRAME_COUNT as f64;
             let image = source_card
-                .render_sample(time, true, execution, &mut cache, &mut effects)
+                .render_sample(time, true, execution, &cache, &mut effects)
                 .unwrap()
                 .image()
                 .unwrap();
             let sample = (source.id, Some(time.to_bits()));
             assert!(
-                cache.images[&sample]
+                crate::pointwise::guard(&cache.rasters).images[&sample]
                     .materialize(0)
                     .unwrap()
                     .shares_read_only_backing(&image.materialize(0).unwrap())
             );
-            let operations = cache.order.len();
+            let operations = crate::pointwise::guard(&cache.rasters).order.len();
             let reread = source_card
-                .render_sample(time, true, execution, &mut cache, &mut effects)
+                .render_sample(time, true, execution, &cache, &mut effects)
                 .unwrap()
                 .image()
                 .unwrap();
-            assert_eq!(cache.order.len(), operations);
+            assert_eq!(
+                crate::pointwise::guard(&cache.rasters).order.len(),
+                operations
+            );
             assert!(
                 reread
                     .materialize(0)
@@ -347,7 +375,7 @@ mod tests {
                     .shares_read_only_backing(&image.materialize(0).unwrap())
             );
             let actual = downstream_card
-                .render_sample(time, true, execution, &mut cache, &mut effects)
+                .render_sample(time, true, execution, &cache, &mut effects)
                 .unwrap()
                 .image()
                 .unwrap();
