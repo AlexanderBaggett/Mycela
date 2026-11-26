@@ -37,6 +37,11 @@ const INPUT_WIRE_SPACE: f32 = 2.5;
 const INPUT_ROW_HEIGHT: f32 = CARD_WIDTH + INPUT_WIRE_SPACE;
 const OUTPUT_TERMINAL_SPACE: f32 = 4.5;
 
+enum TreePlacement {
+    Add(Option<Point<Pixels>>),
+    Paste(Option<Point<Pixels>>),
+}
+
 struct GraphClipboard(Node);
 impl gpui_kit::Global for GraphClipboard {}
 
@@ -989,66 +994,62 @@ impl Render for CardDragPreview {
             .child(self.title.clone())
     }
 }
-/// UI admission policy: do not send a cycle to source-shaped recursive Parent
-/// notification. It reads real slots/Contents, and never rewrites engine policy.
+/// Check the physical graph before an edit can recurse through Parent
+/// notifications. Template internals can outnumber the file's node records.
 fn admits(source: &Node, destination: &Target, depth: usize) -> Result<(), String> {
     let forbidden = match destination {
-        Target::Slot(slot) => Some(slot.parent()),
+        Target::Slot(slot) => Some(slot.parent().occurrence_id()),
         Target::Branch(..) => None,
     };
     let mut pending = vec![(source.clone(), depth, false)];
-    let mut active: Vec<Node> = Vec::new();
-    let mut seen: Vec<Node> = Vec::new();
+    let mut active = HashSet::new();
+    let mut seen = HashSet::new();
     while let Some((node, depth, leaving)) = pending.pop() {
+        let id = node.occurrence_id();
         if leaving {
-            active.pop();
-            seen.push(node);
+            active.remove(&id);
+            seen.insert(id);
             continue;
         }
-        if forbidden.as_ref().is_some_and(|p| p.same_reference(&node))
-            || active.iter().any(|p| p.same_reference(&node))
-        {
+        if forbidden == Some(id) || active.contains(&id) {
             return Err("This connection would create a cycle. Choose another node.".into());
         }
-        if seen.iter().any(|old| old.same_reference(&node)) {
+        if seen.contains(&id) {
             continue;
         }
-        if depth >= 128 || seen.len() + active.len() >= 4096 {
-            return Err("This connection exceeds the editor’s supported graph size.".into());
+        if depth >= model::MAX_DEPTH {
+            return Err("This connection would nest the graph too deeply.".into());
         }
-        active.push(node.clone());
+        active.insert(id);
         pending.push((node.clone(), depth, true));
-        for child in node
-            .slots()
-            .into_iter()
-            .chain(node.contents())
-            .filter_map(|s| s.node())
-        {
-            pending.push((child, depth + 1, false));
-        }
-    }
-    Ok(())
-}
-fn reachable(roots: Vec<Node>, wanted: &Node) -> bool {
-    let mut pending = roots;
-    let mut seen: Vec<Node> = Vec::new();
-    while let Some(node) = pending.pop() {
-        if node.same_reference(wanted) {
-            return true;
-        }
-        if seen.iter().any(|n| n.same_reference(&node)) {
-            continue;
-        }
-        if seen.len() >= 4096 {
-            return false;
-        }
-        seen.push(node.clone());
         pending.extend(
             node.slots()
                 .into_iter()
                 .chain(node.contents())
-                .filter_map(|s| s.node()),
+                .filter_map(|slot| slot.node())
+                .map(|child| (child, depth + 1, false)),
         );
+    }
+    Ok(())
+}
+
+fn reachable(roots: Vec<Node>, wanted: &Node) -> bool {
+    let wanted = wanted.occurrence_id();
+    let mut pending = roots;
+    let mut seen = HashSet::new();
+    while let Some(node) = pending.pop() {
+        let id = node.occurrence_id();
+        if id == wanted {
+            return true;
+        }
+        if seen.insert(id) {
+            pending.extend(
+                node.slots()
+                    .into_iter()
+                    .chain(node.contents())
+                    .filter_map(|slot| slot.node()),
+            );
+        }
     }
     false
 }
@@ -2174,7 +2175,7 @@ impl GraphDocumentView {
                 return;
             }
         };
-        self.canvas_insert_tree(node, cursor, window, cx);
+        self.canvas_insert_tree(node, TreePlacement::Add(cursor), window, cx);
     }
 
     pub(super) fn has_copied_node(cx: &App) -> bool {
@@ -2202,20 +2203,43 @@ impl GraphDocumentView {
         cx.notify();
     }
 
-    pub(super) fn paste_node_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn copied_node(&mut self, cx: &mut Context<Self>) -> Option<Node> {
         if self.closed || self.is_busy() || self.overview_open || self.has_field_drafts(cx) {
-            return;
+            return None;
         }
         let Some(clipboard) = cx.try_global::<GraphClipboard>() else {
-            return;
+            self.error = Some("Copy a node before pasting.".into());
+            cx.notify();
+            return None;
         };
-        let node = match clipboard.0.source_clone() {
-            Ok(node) => node,
+        match clipboard.0.source_clone() {
+            Ok(node) => Some(node),
             Err(error) => {
                 self.error = Some(format!("Couldn’t paste the node: {error}"));
                 cx.notify();
-                return;
+                None
             }
+        }
+    }
+
+    pub(super) fn paste_node_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(node) = self.copied_node(cx) else {
+            return;
+        };
+        let bounds = self.canvas.scroll.bounds();
+        let mouse = window.mouse_position();
+        let cursor = (self.canvas.visible && self.canvas.has_viewport() && bounds.contains(&mouse))
+            .then_some(mouse - bounds.origin);
+        self.canvas_insert_tree(node, TreePlacement::Paste(cursor), window, cx);
+    }
+
+    pub(super) fn paste_node_into_selection(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(node) = self.copied_node(cx) else {
+            return;
         };
         let target = self
             .selection
@@ -2234,15 +2258,14 @@ impl GraphDocumentView {
             }
             self.commit_canvas_input(&target, &node, window, cx);
         } else {
-            self.ensure_history_binding();
-            self.canvas_insert_tree(node, None, window, cx);
+            self.canvas_insert_tree(node, TreePlacement::Paste(None), window, cx);
         }
     }
 
     fn canvas_insert_tree(
         &mut self,
         node: Node,
-        cursor: Option<Point<Pixels>>,
+        placement: TreePlacement,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -2258,6 +2281,10 @@ impl GraphDocumentView {
             self.rebuild(window, cx);
             return;
         }
+        let (cursor, anchor_y, paste) = match placement {
+            TreePlacement::Add(cursor) => (cursor, CARD_TITLE_CENTER_Y, false),
+            TreePlacement::Paste(cursor) => (cursor, CARD_WIDTH / 2., true),
+        };
         let input_height = if canvas_ports(&node).is_empty() {
             0.
         } else {
@@ -2267,10 +2294,10 @@ impl GraphDocumentView {
             let viewport = self.canvas.viewport(window.rem_size());
             let [x, y] = viewport.world_point(cursor, self.canvas.scroll.offset());
             self.canvas
-                .branch_position([x - CARD_WIDTH / 2., y - CARD_TITLE_CENTER_Y - input_height])
+                .branch_position([x - CARD_WIDTH / 2., y - anchor_y - input_height])
         });
         let empty_canvas = self.canvas.cards.is_empty();
-        if cursor.is_some() || group.is_some() {
+        if paste || cursor.is_some() || group.is_some() {
             self.ensure_history_binding();
         }
         let stamp = self.begin_history_edit();
@@ -2282,7 +2309,7 @@ impl GraphDocumentView {
                 .contents()
                 .into_iter()
                 .find(|slot| slot.node().is_none());
-            if let Some(slot) = vacant.filter(|_| cursor.is_none() || empty_canvas) {
+            if let Some(slot) = vacant.filter(|_| !paste && (cursor.is_none() || empty_canvas)) {
                 self.edit_target(&Target::Slot(slot), Some(&node))
             } else {
                 self.edit_with_history_fallback(|_| {
@@ -2295,7 +2322,7 @@ impl GraphDocumentView {
                         })
                 })
             }
-        } else if cursor.is_some() && empty_canvas {
+        } else if !paste && cursor.is_some() && empty_canvas {
             self.edit_target(&Target::Branch(0, None), Some(&node))
         } else {
             self.edit_with_history_fallback(|document| {
@@ -2325,7 +2352,7 @@ impl GraphDocumentView {
                     self.canvas.zoom,
                 );
                 self.canvas.anchor_at(
-                    [x + CARD_WIDTH / 2., y + CARD_TITLE_CENTER_Y + input_height],
+                    [x + CARD_WIDTH / 2., y + anchor_y + input_height],
                     cursor,
                     viewport,
                 );

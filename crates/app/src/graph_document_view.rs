@@ -150,6 +150,7 @@ gpui_kit::actions!(
         ExportGraphImage,
         CopyNodeTree,
         PasteNodeTree,
+        PasteNodeIntoSelection,
         UndoGraphEdit,
         RedoGraphEdit,
         RemoveCustomCurvePoint,
@@ -1094,6 +1095,9 @@ impl GraphDocumentView {
         let draft = &mut self.inspector.drafts[index];
         if draft.commit_live(cx) {
             let structural = draft.changes_socket_count();
+            if draft.edits_direct_gradient() {
+                self.node_previews.report_local_gradient_edit(self.revision);
+            }
             self.finish_history_edit(stamp, true);
             self.revision += 1;
             self.status = None;
@@ -4799,7 +4803,7 @@ impl Render for GraphDocumentView {
             || self.drawing.is_some()
             || !self.canvas.visible
         {
-            self.node_previews.clear();
+            self.node_previews.suspend();
         }
         let lab_section_panel = self.render_lab_section_panel(busy, rem, cx);
         let panels = if results_visible {
@@ -5027,6 +5031,9 @@ impl Render for GraphDocumentView {
                 }))
                 .on_action(cx.listener(|view, _: &PasteNodeTree, window, cx| {
                     view.paste_node_tree(window, cx);
+                }))
+                .on_action(cx.listener(|view, _: &PasteNodeIntoSelection, window, cx| {
+                    view.paste_node_into_selection(window, cx);
                 }))
                 .on_action(cx.listener(|view, _: &ExportGraphImage, window, cx| {
                     view.open_export_image(window, cx)

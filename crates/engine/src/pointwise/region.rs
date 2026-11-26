@@ -10,7 +10,7 @@ use std::{
 };
 static NEXT: AtomicU64 = AtomicU64::new(1);
 static MERGE: Mutex<()> = Mutex::new(());
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Hash)]
 pub(super) struct NodeId(u64);
 impl NodeId {
     pub(super) fn get(self) -> u64 {

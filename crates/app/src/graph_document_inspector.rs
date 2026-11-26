@@ -661,6 +661,13 @@ impl Draft {
         )
     }
 
+    pub(super) fn edits_direct_gradient(&self) -> bool {
+        matches!(&self.binding, Binding::Generator(property) | Binding::GeneratorAxis(property, _)
+            if property.owner().kind() == ImageGeneratorKind::Gradient
+                && property.binding_index() < 0
+                && property.is_animated().is_ok_and(|animated| !animated))
+    }
+
     pub(super) fn changes_socket_count(&self) -> bool {
         let Binding::Number(property) = &self.binding else {
             return false;

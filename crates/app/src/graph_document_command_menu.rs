@@ -141,9 +141,14 @@ impl GraphDocumentView {
                         .action(Box::new(CopyNodeTree)),
                 )
                 .item(
-                    PopupMenuItem::new("Paste into selection")
+                    PopupMenuItem::new("Paste node")
                         .disabled(!can_paste)
                         .action(Box::new(PasteNodeTree)),
+                )
+                .item(
+                    PopupMenuItem::new("Paste into selection")
+                        .disabled(!can_paste)
+                        .action(Box::new(PasteNodeIntoSelection)),
                 )
                 .when_some(selected_node.clone(), |menu, key| {
                     let owner = edit_owner.clone();

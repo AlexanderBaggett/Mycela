@@ -14,6 +14,10 @@ use std::collections::{BTreeMap, BTreeSet};
 #[path = "graph_final_cache_inputs.rs"]
 mod cache_inputs;
 pub(in crate::pointwise) use cache_inputs::FinalExportCacheTree;
+#[path = "graph_thumbnail_cache.rs"]
+mod thumbnail_cache;
+pub use thumbnail_cache::PointwiseThumbnailCache;
+pub(in crate::pointwise) use thumbnail_cache::ThumbnailReuse;
 
 /// The private final-render copies of a graph and its enclosing groups.
 /// Each original accepts cache writes from the latest eligible copy by identity.
@@ -24,6 +28,10 @@ pub struct PointwiseFinalGraph<E = ()> {
 }
 
 impl<E> PointwiseFinalGraph<E> {
+    pub(in crate::pointwise) fn source_nodes(&self) -> impl Iterator<Item = NodeId> {
+        self.originals.values().map(|node| node.id)
+    }
+
     pub(in crate::pointwise) fn selected_id(&self) -> NodeId {
         self.selected.id
     }
@@ -46,6 +54,11 @@ impl StillExportCachePolicy {
 }
 
 impl<E: 'static> PointwiseNode<E> {
+    /// Revision of this node's retained render data after graph invalidation.
+    pub fn render_revision(&self) -> u64 {
+        self.with_final_cache(|cache| cache.revision)
+    }
+
     fn with_final_cache<T>(&self, f: impl FnOnce(&mut FinalImageCache) -> T) -> T {
         let core = self.core();
         match &core.payload {
@@ -901,6 +914,7 @@ pub(in crate::pointwise) enum FinalImageReuse<'a> {
     None,
     Original,
     Playback(&'a mut PlaybackImageCache),
+    Thumbnail(ThumbnailReuse<'a>),
 }
 
 /// Only used for a single playback request on one detached final graph.
@@ -1037,7 +1051,11 @@ impl<E: 'static> FinalGraphExecution<'_, E> {
                 .get(&node.id)
                 .filter(|image| image.geometry() == geometry)
                 .map(SharedImageMap::share_pixel_backing),
+            FinalImageReuse::Thumbnail(reuse) => reuse.lookup(self.originals[&node.id].id),
         }?;
+        if let FinalImageReuse::Thumbnail(reuse) = &mut self.reuse {
+            reuse.mark_reused(node.id, self.originals[&node.id].id);
+        }
         self.images.insert(node.id, image.clone());
         Some(image)
     }
@@ -1052,6 +1070,9 @@ impl<E: 'static> FinalGraphExecution<'_, E> {
                 drop(old);
             }
             FinalImageReuse::Playback(cache) => cache.record(node, image, &self.images),
+            FinalImageReuse::Thumbnail(reuse) => {
+                reuse.record(node, self.originals[&node.id].id, image)
+            }
         }
     }
 

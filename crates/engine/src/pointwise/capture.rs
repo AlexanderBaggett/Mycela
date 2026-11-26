@@ -16,7 +16,8 @@ pub use final_cache::PointwiseFinalExportCache;
 mod pending;
 pub use pending::{
     EnvironmentRenderOverride, FrozenRenderBatch, FrozenRenderValues, MaterializedRenderBatch,
-    PendingFilterRender, PendingGradientRender, PendingNodeRender, RenderFreezeSession,
+    PendingFilterRender, PendingGradientRender, PendingNodeRender, PendingThumbnailRender,
+    RenderFreezeSession,
 };
 
 /// The after-values of a staged editor edit, keyed by source graph occurrence.
@@ -216,7 +217,7 @@ pub struct RenderCaptureSession<E = ()> {
         super::wire::SharedPropertyAdjustment<E>,
     )>,
     filters: Vec<(PointwiseFilter<E>, PointwiseFilter<E>)>,
-    nodes: NodeCopies<E>,
+    nodes: std::collections::HashMap<NodeId, (crate::PointwiseNode<E>, crate::PointwiseNode<E>)>,
     inverts: Vec<(CapturedInvertNode<E>, CapturedInvertNode<E>)>,
 }
 impl<E: 'static> Default for RenderCaptureSession<E> {
@@ -257,7 +258,7 @@ impl<E: 'static> RenderCaptureSession<E> {
             animation_limits: Vec::new(),
             adjustments: Vec::new(),
             filters: Vec::new(),
-            nodes: Vec::new(),
+            nodes: std::collections::HashMap::new(),
             inverts: Vec::new(),
         }
     }
@@ -1157,13 +1158,13 @@ impl<E: 'static> RenderCaptureSession<E> {
         &mut self,
         value: &super::super::PointwiseNode<E>,
     ) -> Result<super::super::PointwiseNode<E>, PointwiseError<E>> {
-        if let Some((_, copy)) = self.nodes.iter().find(|(old, _)| old.same_reference(value)) {
+        if let Some((_, copy)) = self.nodes.get(&value.id) {
             return Ok(copy.clone());
         }
         let copy = self.copy_node_value(value)?;
         // Publish/memo BEFORE traversing Parent or Slots: child-first capture
         // must converge through its parent Median's slot back to this owner.
-        self.nodes.push((value.clone(), copy.clone()));
+        self.nodes.insert(value.id, (value.clone(), copy.clone()));
         if value.kind() == Some(PointwiseKind::Reference) {
             let property = value
                 .filter()
@@ -1279,7 +1280,7 @@ impl<E: 'static> RenderCaptureSession<E> {
     fn captured_node_identities(&self) -> CapturedNodeIdentities {
         Arc::new(
             self.nodes
-                .iter()
+                .values()
                 .map(|(source, copy)| (copy.id, source.id))
                 .collect(),
         )
@@ -1433,7 +1434,71 @@ impl<E> Clone for PointwiseNodeRenderSnapshot<E> {
         }
     }
 }
+/// A captured canvas card, with one reusable final graph across its samples.
+pub struct PointwiseThumbnailRender<E = ()> {
+    snapshot: PointwiseNodeRenderSnapshot<E>,
+    graph: Option<crate::PointwiseFinalGraph<E>>,
+    ambiguous_sources: std::collections::HashSet<NodeId>,
+}
+
+impl<E: 'static> PointwiseThumbnailRender<E> {
+    /// Render one frame at the requested time. A legacy-only animated graph may
+    /// return its full retained sequence when it cannot render a final sample.
+    pub fn render_sample(
+        &self,
+        time: f64,
+        animated: bool,
+        execution: crate::ProceduralExecution,
+        cache: &mut crate::PointwiseThumbnailCache,
+        effects: &mut crate::PointwiseRenderEffects<'_, E>,
+    ) -> Result<crate::PointwiseRenderOutcome<E>, PointwiseError<E>> {
+        use crate::pointwise::graph::{FinalImageReuse, ThumbnailReuse};
+        let geometry = cache.geometry();
+        let options = cache.options();
+        let result = if let Some(graph) = &self.graph {
+            let reuse =
+                ThumbnailReuse::new(cache, &self.snapshot.origins, &self.ambiguous_sources, time);
+            graph.render_frame(
+                geometry,
+                time,
+                execution,
+                options,
+                FinalImageReuse::Thumbnail(reuse),
+                effects,
+            )
+        } else {
+            self.snapshot
+                .render_export_frame(None, geometry, time, execution, options, effects)
+        };
+        match result {
+            Err(error) if animated && self.graph.is_none() && error.is_unsupported_capability() => {
+                self.snapshot
+                    .render_preview_with_effects(geometry, execution, effects)
+            }
+            other => other,
+        }
+    }
+}
+
 impl<E: 'static> PointwiseNodeRenderSnapshot<E> {
+    pub fn prepare_thumbnail(self) -> Result<PointwiseThumbnailRender<E>, PointwiseError<E>> {
+        let graph = self.node.clone_supported_final_graph()?;
+        let mut seen = std::collections::HashSet::new();
+        let mut ambiguous_sources = std::collections::HashSet::new();
+        if let Some(graph) = &graph {
+            for source in graph.source_nodes() {
+                if !seen.insert(source) {
+                    ambiguous_sources.insert(source);
+                }
+            }
+        }
+        Ok(PointwiseThumbnailRender {
+            snapshot: self,
+            graph,
+            ambiguous_sources,
+        })
+    }
+
     pub fn render_scene_with_effects(
         &self,
         effects: &mut crate::SceneAllocationEffects<'_>,

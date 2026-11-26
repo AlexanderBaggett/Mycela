@@ -5,6 +5,7 @@ target/
 /bin/
 /mycela
 /mycela-app
+/.mycela-app.*
 *.exe
 *.dll
 *.dll.lib

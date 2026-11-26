@@ -7,6 +7,30 @@ use crate::{
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
+#[path = "lab_noise.rs"]
+mod noise;
+
+enum WizardTemplate {
+    Native(&'static str),
+    Bundled(&'static str, &'static [u8]),
+}
+
+impl WizardTemplate {
+    fn resolve(path: &str) -> Option<Self> {
+        const NOISE_CHOICES: &[&str] = &["None", "Use Input", "3D Noise", "Matrix Noise", "Cells"];
+        if let Some(key) = NOISE_CHOICES.iter().copied().find(|key| *key == path) {
+            return Some(Self::Native(key));
+        }
+        super::lab_assets::read(path).map(|(key, bytes)| Self::Bundled(key, bytes))
+    }
+
+    fn key(&self) -> &'static str {
+        match self {
+            Self::Native(key) | Self::Bundled(key, _) => key,
+        }
+    }
+}
+
 pub(in crate::pointwise) fn read_style_noise_lab<E: 'static>(
     reader: &mut BinaryCursor<'_>,
     version: f64,
@@ -80,7 +104,10 @@ pub(super) fn attach_template<E: 'static>(
     lab: TemplateLabKind,
     context: &mut NodeWireReadContext<'_, E>,
 ) -> Result<(), NodeWireError<E>> {
-    if let Some(path) = lab.template().contents {
+    if matches!(lab, TemplateLabKind::Noise | TemplateLabKind::SelectNoise) {
+        let principal = noise::template(lab, context)?;
+        node.content(0)?.set_node_quiet(principal.as_ref())?;
+    } else if let Some(path) = lab.template().contents {
         let (path, bytes) = super::lab_assets::read(path)
             .ok_or_else(|| NodeWireError::MissingLabTemplate(path.into()))?;
         let principal = read_principal(path, bytes, context)?;
@@ -126,7 +153,7 @@ pub(in crate::pointwise) fn switch_wizard_template<E: 'static>(
     reference: &PointwiseFilter<E>,
     index: i32,
 ) -> Result<(), PointwiseError<E>> {
-    // The currently editable options resolve only against bundled templates.
+    // Only templates provided by Mycela can be selected here.
     let mut context = NodeWireReadContext::for_raw_node();
     select_template(reference, index, &mut context).map_err(|error| match error {
         NodeWireError::Node(error) => error,
@@ -158,25 +185,30 @@ fn select_template<E: 'static>(
         .as_ref()
         .map(|path| {
             let path = String::from_utf16(path).map_err(|_| PointwiseError::Argument)?;
-            super::lab_assets::read(&path).ok_or(NodeWireError::MissingLabTemplate(path))
+            WizardTemplate::resolve(&path).ok_or(NodeWireError::MissingLabTemplate(path))
         })
         .transpose()?;
-    let path_key = path.map(|(path, _)| path);
+    let path_key = path.as_ref().map(WizardTemplate::key);
     if reference.wizard_template() == path_key {
         return Ok(());
     }
     let node = reference.node();
     let slot = node.content(0)?;
     let previous = slot.node();
-    let principal = match path {
-        Some((path, bytes)) => match reference.cached_wizard_template(path) {
-            Some(id) => Some(PointwiseNode {
+    let principal = if let Some(path) = path {
+        if let Some(id) = reference.cached_wizard_template(path.key()) {
+            Some(PointwiseNode {
                 id,
                 sponsor: node.sponsor.clone(),
-            }),
-            None => read_principal(path, bytes, context)?,
-        },
-        None => None,
+            })
+        } else {
+            match path {
+                WizardTemplate::Native(key) => noise::choice(key, context)?,
+                WizardTemplate::Bundled(key, bytes) => read_principal(key, bytes, context)?,
+            }
+        }
+    } else {
+        None
     };
     // Apply inherited control values before publishing the selected occurrence.
     if let Some(principal) = &principal {

@@ -4122,9 +4122,9 @@ impl<E: 'static> HistoryGraphEdit<E> for CurveEdit<E> {
 pub(crate) mod capture;
 pub use capture::{
     EnvironmentRenderOverride, FrozenRenderBatch, FrozenRenderValues, MaterializedRenderBatch,
-    PendingFilterRender, PendingGradientRender, PendingNodeRender, PointwiseFinalExportCache,
-    PointwiseNodeRenderSnapshot, PointwiseRenderSnapshot, RenderCaptureSession,
-    RenderFreezeSession,
+    PendingFilterRender, PendingGradientRender, PendingNodeRender, PendingThumbnailRender,
+    PointwiseFinalExportCache, PointwiseNodeRenderSnapshot, PointwiseRenderSnapshot,
+    PointwiseThumbnailRender, RenderCaptureSession, RenderFreezeSession,
 };
 
 #[path = "retained_spatial.rs"]

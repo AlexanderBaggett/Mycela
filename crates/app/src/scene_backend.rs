@@ -61,9 +61,14 @@ impl CameraFrame {
     }
 }
 
-struct Backend<'a> {
+#[derive(Default)]
+pub(crate) struct PreviewDevices {
     renderer: Option<SceneRenderer>,
     shader: Option<mycela_renderer::ShaderRenderer>,
+}
+
+struct Backend<'a> {
+    devices: &'a mut PreviewDevices,
     camera: SceneCamera<ForegroundError>,
     cancelled: &'a dyn Fn() -> bool,
     // The required atomic is inactive; the borrowed predicate above is the
@@ -87,13 +92,13 @@ impl Backend<'_> {
                 "scene renderer cancelled",
             ));
         }
-        if self.renderer.is_none() {
+        if self.devices.renderer.is_none() {
             let profile = SceneTargetProfile::new(
                 SceneLayerColor::GeneticaOpenGl8,
                 SceneDepthPrecision::Float32,
             );
             match pollster::block_on(SceneRenderer::new(profile)) {
-                Ok(renderer) => self.renderer = Some(renderer),
+                Ok(renderer) => self.devices.renderer = Some(renderer),
                 Err(error) => {
                     self.failure = Some(failure(format!(
                         "Couldn’t initialize the scene renderer: {error}"
@@ -134,6 +139,7 @@ impl Backend<'_> {
             CameraShading::UvMaterial => request.with_uv_material_camera(),
         };
         match self
+            .devices
             .renderer
             .as_ref()
             .expect("renderer was initialized")
@@ -160,10 +166,11 @@ impl SceneImageRenderer<ForegroundError> for Backend<'_> {
         time: f64,
     ) -> Result<SharedImageMap, PointwiseError<ForegroundError>> {
         let result = pollster::block_on(async {
-            if self.shader.is_none() {
-                self.shader = Some(mycela_renderer::ShaderRenderer::new().await?);
+            if self.devices.shader.is_none() {
+                self.devices.shader = Some(mycela_renderer::ShaderRenderer::new().await?);
             }
-            self.shader
+            self.devices
+                .shader
                 .as_ref()
                 .expect("initialized renderer")
                 .render(
@@ -189,6 +196,7 @@ impl SceneImageRenderer<ForegroundError> for Backend<'_> {
     fn material_texture_limit(&mut self) -> Result<u32, PointwiseError<ForegroundError>> {
         self.ensure_renderer()?;
         Ok(self
+            .devices
             .renderer
             .as_ref()
             .ok_or(PointwiseError::UnsupportedCapability(
@@ -329,6 +337,26 @@ pub(crate) fn render_graph_playback(
     })
 }
 
+pub(crate) fn render_thumbnail_sample(
+    renderer: &mycela_engine::PointwiseThumbnailRender<ForegroundError>,
+    time: f64,
+    animated: bool,
+    cache: &mut mycela_engine::PointwiseThumbnailCache,
+    devices: &mut PreviewDevices,
+    cancelled: &impl Fn() -> bool,
+    library: &mycela_engine::EnvironmentResourceLibrary,
+) -> Result<RenderedImage, RenderError> {
+    evaluate_with_devices(devices, cancelled, None, Some(library), |effects| {
+        renderer.render_sample(
+            time,
+            animated,
+            crate::export_render::generator_execution(),
+            cache,
+            effects,
+        )
+    })
+}
+
 pub(crate) fn render_export(
     snapshot: &PointwiseNodeRenderSnapshot<ForegroundError>,
     geometry: mycela_engine::ImageGeometry,
@@ -438,12 +466,32 @@ fn evaluate(
         PointwiseError<ForegroundError>,
     >,
 ) -> Result<RenderedImage, RenderError> {
+    evaluate_with_devices(
+        &mut PreviewDevices::default(),
+        cancelled,
+        camera,
+        library,
+        execute,
+    )
+}
+
+fn evaluate_with_devices(
+    devices: &mut PreviewDevices,
+    cancelled: &impl Fn() -> bool,
+    camera: Option<&CameraFrame>,
+    library: Option<&mycela_engine::EnvironmentResourceLibrary>,
+    execute: impl FnOnce(
+        &mut PointwiseRenderEffects<'_, ForegroundError>,
+    ) -> Result<
+        mycela_engine::PointwiseRenderOutcome<ForegroundError>,
+        PointwiseError<ForegroundError>,
+    >,
+) -> Result<RenderedImage, RenderError> {
     if cancelled() {
         return Err(RenderError::Cancelled);
     }
     let mut backend = Backend {
-        shader: None,
-        renderer: None,
+        devices,
         camera: match camera {
             Some(frame) => frame.camera.source_copy().map_err(failure)?,
             None => SceneCamera::source_preview(),
@@ -985,10 +1033,10 @@ mod image_scene_tests {
     #[ignore = "requires a real supported GPU adapter and the renderer's texture features"]
     fn real_gpu_scene_uses_actual_child_color_and_opacity() {
         let cancelled = || false;
+        let mut devices = PreviewDevices::default();
         let mut backend = Observe {
             inner: Backend {
-                shader: None,
-                renderer: None,
+                devices: &mut devices,
                 camera: SceneCamera::source_preview(),
                 cancelled: &cancelled,
                 inactive: AtomicBool::new(false),
@@ -1080,10 +1128,10 @@ mod image_scene_tests {
         let clear = SceneClearLightsNode::new().node();
         clear.slot(0).unwrap().set_node(Some(&combine)).unwrap();
         let cancelled = || false;
+        let mut devices = PreviewDevices::default();
         let mut backend = Observe {
             inner: Backend {
-                shader: None,
-                renderer: None,
+                devices: &mut devices,
                 camera: SceneCamera::source_preview(),
                 cancelled: &cancelled,
                 inactive: AtomicBool::new(false),

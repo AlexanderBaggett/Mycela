@@ -143,7 +143,7 @@ pub use graph::{
     PointwiseCachedRenderMode, PointwiseChannelGuarantees, PointwiseFinalGraph, PointwiseNode,
     PointwiseNodeChangeHandler, PointwisePreparationHandler, PointwiseRenderOptions,
     PointwiseRenderOutcome, PointwiseSlot, PointwiseSlotChange, PointwiseSlotChangeHandler,
-    RenderedImage, SharedDefaultInputMapping,
+    PointwiseThumbnailCache, RenderedImage, SharedDefaultInputMapping,
 };
 pub use image::SharedImageMap;
 pub use invert_node::{
@@ -162,11 +162,11 @@ pub use property::{
     EnvironmentRenderOverride, FrozenRenderBatch, FrozenRenderValues, Histogram,
     ImportedImageContainer, ImportedImageDecodeError, ImportedImageReporting,
     MaterializedRenderBatch, PendingFilterRender, PendingGradientRender, PendingNodeRender,
-    PointwiseCacheHandler, PointwiseCloneMode, PointwiseCustomObject, PointwiseFilter,
-    PointwiseFinalExportCache, PointwiseImportedImage, PointwiseKind, PointwiseMatrix,
-    PointwiseMatrixHandler, PointwiseNodeRenderSnapshot, PointwiseParameter,
+    PendingThumbnailRender, PointwiseCacheHandler, PointwiseCloneMode, PointwiseCustomObject,
+    PointwiseFilter, PointwiseFinalExportCache, PointwiseImportedImage, PointwiseKind,
+    PointwiseMatrix, PointwiseMatrixHandler, PointwiseNodeRenderSnapshot, PointwiseParameter,
     PointwiseParameterValue, PointwisePropertyChange, PointwisePropertyHandler, PointwiseRegion,
-    PointwiseRenderSnapshot, RenderCaptureSession, RenderFreezeSession,
+    PointwiseRenderSnapshot, PointwiseThumbnailRender, RenderCaptureSession, RenderFreezeSession,
 };
 pub use solid::{PointwiseSolidChangeHandler, PointwiseSolidEditError};
 use std::fmt;

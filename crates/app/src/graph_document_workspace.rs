@@ -184,7 +184,7 @@ impl DocumentWorkspace {
         }
         let results = self.active().update(cx, |view, _| {
             view.pause_preview();
-            view.node_previews.clear();
+            view.node_previews.suspend();
             let stored = std::mem::take(&mut view.results);
             view.results.set_visible(stored.is_visible());
             stored

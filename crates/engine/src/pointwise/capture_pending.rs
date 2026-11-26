@@ -161,6 +161,12 @@ pub struct PendingNodeRender<E = ()> {
     values: FrozenRenderValues,
     ready: Arc<AtomicBool>,
 }
+pub struct PendingThumbnailRender<E = ()> {
+    node: crate::PointwiseNode<E>,
+    time: f64,
+    origins: CapturedNodeIdentities,
+    ready: Arc<AtomicBool>,
+}
 pub struct PendingFilterRender<E = ()> {
     node: PendingNodeRender<E>,
 }
@@ -228,6 +234,26 @@ impl<E: 'static> RenderFreezeSession<E> {
         })();
         self.inner.finish_capture(result)
     }
+    /// Detach canvas geometry and properties without a comparison fingerprint.
+    /// The document's revision owns cancellation and replacement of these frames.
+    pub fn freeze_thumbnail(
+        &mut self,
+        node: &crate::PointwiseNode<E>,
+        time: f64,
+    ) -> Result<PendingThumbnailRender<E>, PointwiseError<E>> {
+        self.inner.ensure_usable()?;
+        let result = self
+            .inner
+            .copy_node_raw(node)
+            .map(|node| PendingThumbnailRender {
+                node,
+                time,
+                origins: self.inner.captured_node_identities(),
+                ready: self.ready.clone(),
+            });
+        self.inner.finish_capture(result)
+    }
+
     pub fn freeze_filter_at_time(
         &mut self,
         value: &PointwiseFilter<E>,
@@ -306,6 +332,22 @@ impl<E: 'static> PendingNodeRender<E> {
         batch.inner.finish_capture(result)
     }
 }
+impl<E: 'static> PendingThumbnailRender<E> {
+    pub fn complete(
+        self,
+        batch: &MaterializedRenderBatch<E>,
+    ) -> Result<PointwiseThumbnailRender<E>, PointwiseError<E>> {
+        batch.check(&self.ready)?;
+        PointwiseNodeRenderSnapshot {
+            node: self.node,
+            origins: self.origins,
+            time: self.time,
+            comparison: Arc::from([]),
+        }
+        .prepare_thumbnail()
+    }
+}
+
 impl<E: 'static> PendingFilterRender<E> {
     pub fn frozen_values(&self) -> &FrozenRenderValues {
         self.node.frozen_values()

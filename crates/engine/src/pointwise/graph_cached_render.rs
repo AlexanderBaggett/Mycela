@@ -815,7 +815,9 @@ impl<E: 'static> PointwiseNode<E> {
         Ok(())
     }
 
-    fn local_animated_preview_needed(&self) -> Result<bool, PointwiseError<E>> {
+    pub(in crate::pointwise) fn local_animated_preview_needed(
+        &self,
+    ) -> Result<bool, PointwiseError<E>> {
         if self
             .shader_program()
             .is_some_and(|shader| shader.is_time_dependent())

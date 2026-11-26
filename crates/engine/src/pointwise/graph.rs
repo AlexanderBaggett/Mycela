@@ -23,11 +23,12 @@ mod scale;
 pub(in crate::pointwise) use scale::reaches_scaled_reference;
 #[path = "graph_cached_render.rs"]
 mod timed;
-pub use final_render::PointwiseFinalGraph;
+pub(in crate::pointwise) use final_render::ThumbnailReuse;
 pub(in crate::pointwise) use final_render::{
     FinalExportCacheTree, FinalImageReuse, LabSimplifications, PlaybackImageCache,
     StillExportCachePolicy,
 };
+pub use final_render::{PointwiseFinalGraph, PointwiseThumbnailCache};
 pub use mode::{
     PointwiseNodeChangeHandler, PointwiseSlotChange, PointwiseSlotChangeHandler,
     SharedDefaultInputMapping,
