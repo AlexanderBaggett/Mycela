@@ -226,6 +226,7 @@ enum Work {
     Exporting,
     RenderingResult,
     ChoosingSequence,
+    ChoosingVideo,
     RenderingSequence,
     ProjectingResult,
     ChoosingEnvironmentOutput,
@@ -4972,6 +4973,7 @@ impl Render for GraphDocumentView {
                 Some(Work::Exporting) => "Rendering and saving image…".into(),
                 Some(Work::RenderingResult) => "Rendering result…".into(),
                 Some(Work::ChoosingSequence) => "Choose an output folder and sequence name".into(),
+                Some(Work::ChoosingVideo) => "Choose where to save the video".into(),
                 Some(Work::RenderingSequence) => self.sequence_progress.as_ref().map_or_else(
                     || "Rendering image sequence…".into(),
                     |progress| progress.status(),

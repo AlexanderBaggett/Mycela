@@ -4015,6 +4015,7 @@ dependencies = [
  "raw-window-handle",
  "rustix",
  "sysinfo",
+ "tempfile",
  "url",
 ]
 

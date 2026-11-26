@@ -1,4 +1,8 @@
-use super::output::{Naming, SequenceSettings};
+use super::{
+    ExportRequest,
+    output::{Naming, SequenceSettings},
+    video::{self, Codec, FrameRate, VideoSettings},
+};
 use crate::{image_file::Format, solid_color::export_settings::checked_dimensions};
 use gpui_kit::base::{StyledExt, TestSupportExt};
 use gpui_kit::component::{
@@ -11,7 +15,7 @@ use gpui_kit::component::{
 };
 use gpui_kit::{
     App, AppContext, Context, Entity, IntoElement, Render, SharedString, Subscription, Window, div,
-    prelude::*,
+    prelude::*, rems,
 };
 use mycela_engine::ImageGeometry;
 
@@ -48,8 +52,15 @@ fn field(label: &'static str, id: &'static str, state: &Entity<InputState>) -> F
         .child(Input::new(state).id(id).small().aria_label(label))
 }
 
+struct VideoControls {
+    rate: Entity<InputState>,
+    codecs: Entity<SelectState<Vec<Choice<Codec>>>>,
+    available: Result<(), String>,
+}
+
 pub(super) struct Settings {
     source: String,
+    video: Option<VideoControls>,
     width: Entity<InputState>,
     height: Entity<InputState>,
     count: Entity<InputState>,
@@ -74,10 +85,19 @@ pub(super) struct Settings {
 impl Settings {
     pub(super) fn new(
         source: String,
-        previous: Option<SequenceSettings>,
+        video: bool,
+        previous: Option<ExportRequest>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        let previous_video = match previous {
+            Some(ExportRequest::Video(video)) => Some(video),
+            _ => None,
+        };
+        let previous = previous.map(|request| match request {
+            ExportRequest::Sequence(settings) => settings,
+            ExportRequest::Video(settings) => settings.frames,
+        });
         let limit = previous.map_or(DEFAULT_COUNT, |v| v.frame_count);
         let start = previous.map_or(1, |v| v.first);
         let end = previous.map_or(limit, |v| v.last);
@@ -158,6 +178,65 @@ impl Settings {
             cx.observe(&naming, |_, _, cx| cx.notify()),
             cx.observe(&compression, |_, _, cx| cx.notify()),
         ];
+        let video = video.then(|| {
+            let rate = cx.new(|cx| {
+                InputState::new(window, cx).default_value(
+                    previous_video
+                        .map_or(FrameRate::DEFAULT, |settings| settings.rate)
+                        .to_string(),
+                )
+            });
+            let codecs = cx.new(|cx| SelectState::new(Vec::new(), None, window, cx));
+            subscriptions.push(cx.observe(&codecs, |settings, _, cx| {
+                settings.error = None;
+                cx.notify();
+            }));
+            subscriptions.push(cx.subscribe(&rate, |settings, _, event, cx| {
+                if matches!(event, InputEvent::Change) {
+                    settings.error = None;
+                    cx.notify();
+                }
+            }));
+            let probe = cx
+                .background_executor()
+                .spawn(async { video::available_codecs() });
+            cx.spawn_in(window, async move |owner, cx| {
+                let result = probe.await;
+                let _ = owner.update_in(cx, |settings, window, cx| {
+                    let Some(video) = &mut settings.video else {
+                        return;
+                    };
+                    video.available = result.map(|available| {
+                        let preferred = previous_video.map(|settings| settings.codec);
+                        let selected = preferred
+                            .and_then(|codec| available.iter().position(|v| *v == codec))
+                            .unwrap_or(0);
+                        video.codecs.update(cx, |codecs, cx| {
+                            codecs.set_items(
+                                available
+                                    .into_iter()
+                                    .map(|value| Choice {
+                                        title: value.label().into(),
+                                        value,
+                                    })
+                                    .collect(),
+                                window,
+                                cx,
+                            );
+                            codecs.set_selected_index(Some(IndexPath::new(selected)), window, cx);
+                        });
+                    });
+                    settings.error = None;
+                    cx.notify();
+                });
+            })
+            .detach();
+            VideoControls {
+                rate,
+                codecs,
+                available: Err("Checking FFmpeg encoders…".into()),
+            }
+        });
         for field in [&count, &first, &last, &padding, &width, &height] {
             subscriptions.push(
                 cx.subscribe_in(field, window, |view, field, event, window, cx| {
@@ -180,6 +259,7 @@ impl Settings {
         }
         Self {
             source,
+            video,
             width,
             height,
             count,
@@ -275,7 +355,7 @@ impl Settings {
         }
     }
 
-    pub(super) fn request(&self, cx: &App) -> Result<SequenceSettings, String> {
+    pub(super) fn request(&self, cx: &App) -> Result<ExportRequest, String> {
         let width = number(&self.width, cx).ok_or("Enter a positive whole number for width.")?;
         let height = number(&self.height, cx).ok_or("Enter a positive whole number for height.")?;
         let (width, height) = checked_dimensions(width, height)?;
@@ -289,7 +369,7 @@ impl Settings {
         let SliderValue::Single(compression) = self.compression.read(cx).value() else {
             unreachable!("single compression control");
         };
-        SequenceSettings {
+        let frames = SequenceSettings {
             geometry: ImageGeometry::new(width, height),
             antialias: self.antialias,
             color_only: self.color_only,
@@ -311,7 +391,25 @@ impl Settings {
                 .selected_value()
                 .unwrap_or(&Naming::Suffix),
         }
-        .validate()
+        .validate()?;
+        if let Some(video) = &self.video {
+            video.available.as_ref().map_err(Clone::clone)?;
+            let codec = *video
+                .codecs
+                .read(cx)
+                .selected_value()
+                .ok_or("Choose a video codec.")?;
+            codec.check_geometry(frames.geometry)?;
+            let rate = FrameRate::parse(&video.rate.read(cx).value())
+                .ok_or("Enter a frame rate from 1 to 240 FPS, such as 30 or 30000/1001.")?;
+            Ok(ExportRequest::Video(VideoSettings {
+                frames,
+                codec,
+                rate,
+            }))
+        } else {
+            Ok(ExportRequest::Sequence(frames))
+        }
     }
 
     pub(super) fn show_error(&mut self, error: String, cx: &mut Context<Self>) {
@@ -390,16 +488,18 @@ impl Render for Settings {
                                 cx.notify();
                             })),
                     )
-                    .child(
-                        Checkbox::new("sequence-effect-maps")
-                            .small()
-                            .label("Effect maps")
-                            .checked(self.effect_maps)
-                            .on_click(cx.listener(|settings, checked, _, cx| {
-                                settings.effect_maps = *checked;
-                                cx.notify();
-                            })),
-                    ),
+                    .when(self.video.is_none(), |row| {
+                        row.child(
+                            Checkbox::new("sequence-effect-maps")
+                                .small()
+                                .label("Effect maps")
+                                .checked(self.effect_maps)
+                                .on_click(cx.listener(|settings, checked, _, cx| {
+                                    settings.effect_maps = *checked;
+                                    cx.notify();
+                                })),
+                        )
+                    }),
             )
             .child(
                 Checkbox::new("sequence-all")
@@ -423,67 +523,125 @@ impl Render for Settings {
                     root.child(Slider::new(&self.range).w_full())
                 })
             })
-            .child(
-                div()
-                    .v_flex()
-                    .gap_3()
-                    .pt_3()
-                    .border_t_1()
-                    .border_color(theme.border)
-                    .child(section("Image sequence"))
-                    .child(
-                        Form::new()
-                            .columns(2)
-                            .child(
-                                Field::new().label("File format").child(
-                                    Select::new(&self.format)
-                                        .id("sequence-format")
-                                        .small()
-                                        .accessibility_label("File format"),
-                                ),
-                            )
-                            .child(
-                                Field::new().label("Naming pattern").child(
-                                    Select::new(&self.naming)
-                                        .id("sequence-naming")
-                                        .small()
-                                        .accessibility_label("Naming pattern"),
-                                ),
-                            )
-                            .child(field("Number padding", "sequence-padding", &self.padding))
-                            .child(
-                                Field::new().label("Start numbering at").child(
-                                    Select::new(&self.numbering)
-                                        .id("sequence-numbering")
-                                        .small()
-                                        .accessibility_label("Start numbering at"),
-                                ),
-                            ),
-                    )
-                    .when(format == Format::Jpeg, |root| {
-                        root.child(info(format!(
-                            "JPEG compression {}",
-                            self.compression.read(cx).value()
-                        )))
-                        .child(Slider::new(&self.compression).w_full())
-                    })
-                    .child(info(match selected {
-                        Some(1) => format!("1 frame · e.g. {filename_example}"),
-                        Some(count) => format!("{count} frames · e.g. {filename_example}"),
-                        None => format!("Example · {filename_example}"),
-                    })),
-            )
-            .when_some(self.error.clone(), |root, error| {
+            .when_some(self.video.as_ref(), |root, video| {
+                let rate = FrameRate::parse(&video.rate.read(cx).value());
+                let duration = match (&video.available, selected.zip(rate)) {
+                    (Err(message), _) => message.clone(),
+                    (Ok(()), Some((frames, rate))) => {
+                        let label = if frames == 1 { "frame" } else { "frames" };
+                        format!("{frames} {label} · {:.3} s", rate.seconds(frames))
+                    }
+                    (Ok(()), None) => "Duration —".into(),
+                };
+                let validation = self.error.as_ref();
+                let message = validation.cloned().unwrap_or(duration);
                 root.child(
                     div()
-                        .id("sequence-error")
-                        .role(gpui_kit::Role::Alert)
-                        .aria_label(error.clone())
-                        .test_support()
-                        .text_sm()
-                        .text_color(theme.danger)
-                        .child(error),
+                        .v_flex()
+                        .gap_3()
+                        .pt_3()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .child(section("Video"))
+                        .child(
+                            Form::new()
+                                .columns(2)
+                                .child(
+                                    Field::new().label("Codec").child(
+                                        Select::new(&video.codecs)
+                                            .id("video-codec")
+                                            .small()
+                                            .accessibility_label("Video codec")
+                                            .disabled(video.available.is_err()),
+                                    ),
+                                )
+                                .child(field("Frame rate (FPS)", "video-frame-rate", &video.rate)),
+                        )
+                        .child(
+                            div()
+                                .id(if validation.is_some() {
+                                    "sequence-error"
+                                } else {
+                                    "video-duration"
+                                })
+                                .test_support()
+                                .aria_label(message.clone())
+                                .min_h(rems(2.5))
+                                .text_sm()
+                                .text_color(theme.muted_foreground)
+                                .when(validation.is_some(), |message| {
+                                    message.role(gpui_kit::Role::Alert).text_color(theme.danger)
+                                })
+                                .child(message),
+                        ),
                 )
             })
+            .when(self.video.is_none(), |root| {
+                root.child(
+                    div()
+                        .v_flex()
+                        .gap_3()
+                        .pt_3()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .child(section("Image sequence"))
+                        .child(
+                            Form::new()
+                                .columns(2)
+                                .child(
+                                    Field::new().label("File format").child(
+                                        Select::new(&self.format)
+                                            .id("sequence-format")
+                                            .small()
+                                            .accessibility_label("File format"),
+                                    ),
+                                )
+                                .child(
+                                    Field::new().label("Naming pattern").child(
+                                        Select::new(&self.naming)
+                                            .id("sequence-naming")
+                                            .small()
+                                            .accessibility_label("Naming pattern"),
+                                    ),
+                                )
+                                .child(field("Number padding", "sequence-padding", &self.padding))
+                                .child(
+                                    Field::new().label("Start numbering at").child(
+                                        Select::new(&self.numbering)
+                                            .id("sequence-numbering")
+                                            .small()
+                                            .accessibility_label("Start numbering at"),
+                                    ),
+                                ),
+                        )
+                        .when(format == Format::Jpeg, |root| {
+                            root.child(info(format!(
+                                "JPEG compression {}",
+                                self.compression.read(cx).value()
+                            )))
+                            .child(Slider::new(&self.compression).w_full())
+                        })
+                        .child(info(match selected {
+                            Some(1) => format!("1 frame · e.g. {filename_example}"),
+                            Some(count) => format!("{count} frames · e.g. {filename_example}"),
+                            None => format!("Example · {filename_example}"),
+                        })),
+                )
+            })
+            .when_some(
+                self.error.clone().filter(|_| self.video.is_none()),
+                |root, error| {
+                    root.child(
+                        div()
+                            .id("sequence-error")
+                            .role(gpui_kit::Role::Alert)
+                            .aria_label(error.clone())
+                            .test_support()
+                            .text_sm()
+                            .text_color(theme.danger)
+                            .child(error),
+                    )
+                },
+            )
     }
 }

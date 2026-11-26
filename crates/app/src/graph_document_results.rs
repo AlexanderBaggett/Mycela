@@ -523,9 +523,12 @@ impl GraphDocumentView {
             };
             (target, label, node.is_some())
         });
-        let sequence_choices = [RenderTarget::Texture, RenderTarget::Selection].map(|target| {
-            let label = format!("{} animation…", self.result_target_label(target));
-            (target, label, self.result_target(target).is_some())
+        let animation_targets = [RenderTarget::Texture, RenderTarget::Selection].map(|target| {
+            (
+                target,
+                self.result_target_label(target),
+                self.result_target(target).is_some(),
+            )
         });
         let stop_available = self
             .sequence_progress
@@ -550,18 +553,20 @@ impl GraphDocumentView {
                             }),
                     );
                 }
-                menu = menu.separator();
-                for (target, label, available) in sequence_choices.iter().cloned() {
-                    let owner = owner.clone();
-                    menu = menu.item(
-                        PopupMenuItem::new(label)
-                            .disabled(busy || !available)
-                            .on_click(move |_, window, cx| {
-                                let _ = owner.update(cx, |view, cx| {
-                                    view.open_sequence(target, window, cx);
-                                });
-                            }),
-                    );
+                for (video, kind) in [(false, "animation"), (true, "video")] {
+                    menu = menu.separator();
+                    for (target, label, available) in animation_targets {
+                        let owner = owner.clone();
+                        menu = menu.item(
+                            PopupMenuItem::new(format!("{label} {kind}…"))
+                                .disabled(busy || !available)
+                                .on_click(move |_, window, cx| {
+                                    let _ = owner.update(cx, |view, cx| {
+                                        view.open_sequence(target, video, window, cx);
+                                    });
+                                }),
+                        );
+                    }
                 }
                 if stop_available {
                     let owner = owner.clone();

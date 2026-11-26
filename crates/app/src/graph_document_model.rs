@@ -634,7 +634,7 @@ pub(super) fn write_new_file(
     })
 }
 
-fn publish_new_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+pub(super) fn publish_new_file(source: &Path, destination: &Path) -> std::io::Result<()> {
     #[cfg(target_os = "linux")]
     {
         use rustix::fs::{CWD, RenameFlags, renameat_with};
