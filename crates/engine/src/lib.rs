@@ -227,14 +227,14 @@ pub use pointwise::{
     PointwiseNodeChangeHandler, PointwiseNodeRenderSnapshot, PointwiseParameter,
     PointwiseParameterValue, PointwisePreparationHandler, PointwisePropertyChange,
     PointwisePropertyHandler, PointwiseRegion, PointwiseRenderEffects, PointwiseRenderOptions,
-    PointwiseRenderOutcome, PointwiseRenderSnapshot, PointwiseSlot, PointwiseSlotChange,
-    PointwiseSlotChangeHandler, PointwiseSolidChangeHandler, PointwiseSolidEditError,
-    PointwiseThumbnailCache, PointwiseThumbnailRender, RenderCaptureSession, RenderFreezeSession,
-    RenderedImage, SharedDefaultInputMapping, SharedImageMap, SharedPropertyAdjustment,
-    TemplateLabKind, combine_color_arrays, combine_iteration_count,
-    combine_iteration_count_with_capacity_query, combine_map_arrays, create_node_by_identity,
-    fix_map_contrast, hsb_arrays, hsb_to_rgb, interpolate_map_arrays, load_node_binary,
-    point_light_image, render_tone_curve, rgb_to_hsb,
+    PointwiseRenderOutcome, PointwiseRenderSnapshot, PointwiseSequenceRender, PointwiseSlot,
+    PointwiseSlotChange, PointwiseSlotChangeHandler, PointwiseSolidChangeHandler,
+    PointwiseSolidEditError, PointwiseThumbnailCache, PointwiseThumbnailRender,
+    RenderCaptureSession, RenderFreezeSession, RenderedImage, SharedDefaultInputMapping,
+    SharedImageMap, SharedPropertyAdjustment, TemplateLabKind, combine_color_arrays,
+    combine_iteration_count, combine_iteration_count_with_capacity_query, combine_map_arrays,
+    create_node_by_identity, downsample_render, fix_map_contrast, hsb_arrays, hsb_to_rgb,
+    interpolate_map_arrays, load_node_binary, point_light_image, render_tone_curve, rgb_to_hsb,
 };
 
 mod document_container;

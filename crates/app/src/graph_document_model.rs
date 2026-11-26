@@ -622,6 +622,33 @@ pub(super) fn save_new_bytes(
     )
 }
 
+pub(super) fn write_new_file(
+    path: PathBuf,
+    ticket: &Ticket,
+    write: impl FnOnce(&mut File) -> Result<(), String>,
+) -> Result<Option<PathBuf>, String> {
+    write_staged_file(path, ticket, write, |temp, path| {
+        let source = temp.0.as_ref().expect("staged file");
+        publish_new_file(source, path)
+            .map_err(|error| format!("Couldn’t publish {} ({error}).", path.display()))
+    })
+}
+
+fn publish_new_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use rustix::fs::{CWD, RenameFlags, renameat_with};
+        use rustix::io::Errno;
+
+        match renameat_with(CWD, source, CWD, destination, RenameFlags::NOREPLACE) {
+            Ok(()) => return Ok(()),
+            Err(Errno::INVAL | Errno::NOSYS | Errno::OPNOTSUPP) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    std::fs::hard_link(source, destination)
+}
+
 fn write_staged_file(
     path: PathBuf,
     ticket: &Ticket,

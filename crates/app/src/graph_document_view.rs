@@ -84,6 +84,8 @@ mod rename;
 mod results;
 #[path = "graph_document_selector.rs"]
 pub(super) mod selector;
+#[path = "graph_document_sequence.rs"]
+mod sequence;
 #[path = "graph_document_shader.rs"]
 mod shader;
 #[path = "graph_document_style.rs"]
@@ -223,6 +225,8 @@ enum Work {
     ChoosingExport,
     Exporting,
     RenderingResult,
+    ChoosingSequence,
+    RenderingSequence,
     ProjectingResult,
     ChoosingEnvironmentOutput,
     WritingEnvironmentOutput,
@@ -349,6 +353,7 @@ pub struct GraphDocumentView {
     loop_preview: bool,
     error: Option<String>,
     status: Option<String>,
+    sequence_progress: Option<sequence::SequenceProgress>,
     selection_serial: u64,
     inspector_scroll: gpui_kit::ScrollHandle,
     synthesis_source_anchor: gpui_kit::ScrollAnchor,
@@ -593,6 +598,7 @@ impl GraphDocumentView {
             loop_preview: true,
             error: None,
             status: None,
+            sequence_progress: None,
             selection_serial: 0,
             inspector_scroll,
             synthesis_source_anchor,
@@ -705,6 +711,7 @@ impl GraphDocumentView {
         self.lab_thumbnail = None;
         self.node_previews.clear();
         self.results = results::Results::default();
+        self.sequence_progress = None;
     }
     fn restore_tree_selection(&self, cx: &mut Context<Self>) {
         let selected = self.selection.clone();
@@ -4932,6 +4939,7 @@ impl Render for GraphDocumentView {
             self.work,
             Some(
                 Work::RenderingResult
+                    | Work::RenderingSequence
                     | Work::WritingEnvironmentOutput
                     | Work::WritingSynthesisPreset
             )
@@ -4963,6 +4971,11 @@ impl Render for GraphDocumentView {
                 Some(Work::Exporting) if results_visible => "Saving image…".into(),
                 Some(Work::Exporting) => "Rendering and saving image…".into(),
                 Some(Work::RenderingResult) => "Rendering result…".into(),
+                Some(Work::ChoosingSequence) => "Choose an output folder and sequence name".into(),
+                Some(Work::RenderingSequence) => self.sequence_progress.as_ref().map_or_else(
+                    || "Rendering image sequence…".into(),
+                    |progress| progress.status(),
+                ),
                 Some(Work::ProjectingResult) => "Preparing result map…".into(),
                 Some(Work::ChoosingEnvironmentOutput) => "Choose an environment output file".into(),
                 Some(Work::WritingEnvironmentOutput) => {
@@ -5109,9 +5122,23 @@ impl Render for GraphDocumentView {
                                 .child(
                                     Progress::new("render-progress")
                                         .small()
-                                        .loading(true)
+                                        .loading(self.sequence_progress.is_none())
+                                        .value(
+                                            self.sequence_progress
+                                                .as_ref()
+                                                .map_or(0., |p| p.percentage()),
+                                        )
                                         .accessibility_label("Render progress"),
                                 ),
+                        )
+                    })
+                    .when_some(self.sequence_progress.as_ref(), |row, progress| {
+                        row.child(
+                            Button::new("graph-stop-sequence")
+                                .small()
+                                .label("Stop render")
+                                .disabled(!progress.running())
+                                .on_click(cx.listener(|view, _, _, cx| view.stop_sequence(cx))),
                         )
                     }),
             )

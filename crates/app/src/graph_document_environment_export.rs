@@ -8,10 +8,7 @@ mod settings;
 use crate::{
     ForegroundError,
     export_render::generator_execution,
-    solid_color::{
-        map_preview::{PreviewSelection, project_bitmap},
-        preview_export::PreviewPixels,
-    },
+    image_file::{Format, write_hdr, write_standard},
 };
 use gpui_kit::component::{
     WindowExt,
@@ -19,18 +16,14 @@ use gpui_kit::component::{
     dialog::{DialogAction, DialogClose, DialogFooter},
 };
 use gpui_kit::{AppContext, Context, ParentElement, Window};
-use image::{
-    DynamicImage, ImageFormat, Rgb, RgbaImage,
-    codecs::{hdr::HdrEncoder, jpeg::JpegEncoder},
-};
 use mycela_engine::{
     BinaryWriter, EnvironmentPreset, EnvironmentRecord, EnvironmentRenderSettings,
-    EnvironmentResourceLibrary, PointwiseError, SharedImageMap,
+    EnvironmentResourceLibrary, PointwiseError,
 };
 use settings::ExportSettings;
 pub(super) use settings::OutputPreferences;
 use std::{
-    io::{BufWriter, Seek, Write},
+    io::{BufWriter, Write},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -98,53 +91,6 @@ impl FileKind {
                     path.display()
                 )
             }
-        }
-    }
-}
-
-#[derive(Clone, Copy, PartialEq)]
-enum Format {
-    Png,
-    Jpeg,
-    Tga,
-    Tiff,
-    Bmp,
-    Pfm,
-    Hdr,
-}
-
-impl Format {
-    const ALL: [Self; 7] = [
-        Self::Png,
-        Self::Jpeg,
-        Self::Tga,
-        Self::Tiff,
-        Self::Bmp,
-        Self::Pfm,
-        Self::Hdr,
-    ];
-
-    fn extension(self) -> &'static str {
-        match self {
-            Self::Png => "png",
-            Self::Jpeg => "jpg",
-            Self::Tga => "tga",
-            Self::Tiff => "tiff",
-            Self::Bmp => "bmp",
-            Self::Pfm => "pfm",
-            Self::Hdr => "hdr",
-        }
-    }
-
-    fn label(self) -> &'static str {
-        match self {
-            Self::Png => "PNG",
-            Self::Jpeg => "JPEG",
-            Self::Tga => "Targa",
-            Self::Tiff => "TIFF",
-            Self::Bmp => "BMP",
-            Self::Pfm => "PFM",
-            Self::Hdr => "Radiance HDR",
         }
     }
 }
@@ -353,7 +299,7 @@ fn write_environment(
         let mut writer = BufWriter::new(file);
         match format {
             Format::Pfm | Format::Hdr => write_hdr(&rendered, format, &mut writer, &cancelled)?,
-            _ => write_standard(&rendered, format, &mut writer)?,
+            _ => write_standard(&rendered, format, &mut writer, 95)?,
         }
         writer.flush().map_err(model::failure)
     })
@@ -385,6 +331,7 @@ pub(super) fn encode_preset(
         &rendered,
         Format::Jpeg,
         &mut std::io::Cursor::new(&mut thumbnail),
+        95,
     )?;
     let mut preset = EnvironmentPreset::new(map.clone(), thumbnail);
     let mut binary = BinaryWriter::default();
@@ -392,90 +339,13 @@ pub(super) fn encode_preset(
     Ok(Some(binary))
 }
 
-fn write_standard(
-    map: &SharedImageMap,
-    format: Format,
-    writer: &mut (impl Write + Seek),
-) -> Result<(), String> {
-    let bitmap = project_bitmap(map, &PreviewSelection::BaseColor).map_err(model::failure)?;
-    let pixels = PreviewPixels::capture_rendered(&bitmap)?.into_rgba();
-    let image = DynamicImage::ImageRgba8(
-        RgbaImage::from_raw(bitmap.width() as u32, bitmap.height() as u32, pixels)
-            .ok_or("The environment raster dimensions are invalid.")?,
-    );
-    let codec = match format {
-        Format::Png => ImageFormat::Png,
-        Format::Jpeg => {
-            return JpegEncoder::new_with_quality(writer, 95)
-                .encode_image(&image.into_rgb8())
-                .map_err(model::failure);
-        }
-        Format::Tga => ImageFormat::Tga,
-        Format::Tiff => ImageFormat::Tiff,
-        Format::Bmp => ImageFormat::Bmp,
-        Format::Pfm | Format::Hdr => unreachable!("floating-point writer"),
-    };
-    image.write_to(writer, codec).map_err(model::failure)
-}
-
-fn write_hdr(
-    map: &SharedImageMap,
-    format: Format,
-    writer: &mut impl Write,
-    cancelled: &dyn Fn() -> bool,
-) -> Result<(), String> {
-    let geometry = map.geometry();
-    let (width, height) = (geometry.width() as usize, geometry.height() as usize);
-    let channels =
-        [0, 1, 2].map(|channel| map.channel(channel, true).map(|buffer| buffer.values()));
-    let [red, green, blue] = channels;
-    let planes = [
-        red.map_err(model::failure)?,
-        green.map_err(model::failure)?,
-        blue.map_err(model::failure)?,
-    ];
-    let rgb = |index| {
-        planes
-            .each_ref()
-            .map(|plane| plane[if plane.len() == 1 { 0 } else { index }])
-    };
-    if matches!(format, Format::Pfm) {
-        write!(writer, "PF\n{width} {height}\n-1.000000\n").map_err(model::failure)?;
-        for y in (0..height).rev() {
-            if cancelled() {
-                return Ok(());
-            }
-            for x in 0..width {
-                for channel in rgb(y * width + x) {
-                    writer
-                        .write_all(&channel.to_le_bytes())
-                        .map_err(model::failure)?;
-                }
-            }
-        }
-        return Ok(());
-    }
-    let mut pixels = Vec::new();
-    pixels
-        .try_reserve_exact(width * height)
-        .map_err(model::failure)?;
-    for y in 0..height {
-        if cancelled() {
-            return Ok(());
-        }
-        pixels.extend((0..width).map(|x| Rgb(rgb(y * width + x).map(|value| value.max(0.)))));
-    }
-    HdrEncoder::new(writer)
-        .encode(&pixels, width, height)
-        .map_err(model::failure)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use image::ImageFormat;
     use mycela_engine::{
         BinaryCursor, EnvironmentDisplayTone, EnvironmentField, EnvironmentImageProjection,
-        EnvironmentLayerKind, EnvironmentLight, ProceduralExecution,
+        EnvironmentLayerKind, EnvironmentLight, ProceduralExecution, SharedImageMap,
     };
 
     #[test]
@@ -561,7 +431,7 @@ mod tests {
             Format::Bmp,
         ] {
             let mut file = std::io::Cursor::new(Vec::new());
-            write_standard(&image, format, &mut file).unwrap();
+            write_standard(&image, format, &mut file, 95).unwrap();
             let codec = ImageFormat::from_extension(format.extension()).unwrap();
             let decoded = image::load_from_memory_with_format(file.get_ref(), codec)
                 .unwrap()

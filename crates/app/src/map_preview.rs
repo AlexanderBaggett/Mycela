@@ -89,10 +89,10 @@ fn retained_channel(
             .unwrap_or_else(|| FloatBuffer::new(vec![0.0])))
     }
 }
-pub(crate) fn project_bitmap(
+pub(crate) fn project_image(
     image: &SharedImageMap,
     selection: &PreviewSelection,
-) -> Result<PreviewBitmap, ForegroundError> {
+) -> Result<ImageMap, ForegroundError> {
     if image.is_disposed() {
         return Err(failure("The applied image is disposed."));
     }
@@ -130,6 +130,14 @@ pub(crate) fn project_bitmap(
     projection
         .set_buffer(3, &retained_channel(&observation, 3)?)
         .map_err(failure)?;
+    Ok(projection)
+}
+
+pub(crate) fn project_bitmap(
+    image: &SharedImageMap,
+    selection: &PreviewSelection,
+) -> Result<PreviewBitmap, ForegroundError> {
+    let mut projection = project_image(image, selection)?;
     mycela_engine::preview_bitmap(
         Some(&mut projection),
         PreviewBitmapOptions::default().with_dither(false),

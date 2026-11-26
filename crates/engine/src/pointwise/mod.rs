@@ -155,6 +155,23 @@ pub use math::{
     ArithmeticOperation, ArithmeticWorker, HsbOperation, hsb_arrays, hsb_to_rgb, rgb_to_hsb,
 };
 pub use point_light::{PointLightArguments, point_light_image};
+/// Reduce a supersampled export to its destination geometry while retaining
+/// alpha and named maps in their original precision.
+pub fn downsample_render<E>(
+    image: &SharedImageMap,
+    geometry: crate::ImageGeometry,
+    execution: crate::ProceduralExecution,
+) -> Result<SharedImageMap, PointwiseError<E>> {
+    if geometry.width() <= 0
+        || geometry.height() <= 0
+        || geometry.width() > image.geometry().width()
+        || geometry.height() > image.geometry().height()
+    {
+        return Err(PointwiseError::Argument);
+    }
+    image_resize::resize(image, geometry.width(), geometry.height(), execution)
+}
+
 pub use property::levels_editor::{
     LevelsChannel, LevelsControlEdit, LevelsDraft, LevelsInputHistogram, LevelsPoints,
 };
@@ -166,7 +183,8 @@ pub use property::{
     PointwiseFilter, PointwiseFinalExportCache, PointwiseImportedImage, PointwiseKind,
     PointwiseMatrix, PointwiseMatrixHandler, PointwiseNodeRenderSnapshot, PointwiseParameter,
     PointwiseParameterValue, PointwisePropertyChange, PointwisePropertyHandler, PointwiseRegion,
-    PointwiseRenderSnapshot, PointwiseThumbnailRender, RenderCaptureSession, RenderFreezeSession,
+    PointwiseRenderSnapshot, PointwiseSequenceRender, PointwiseThumbnailRender,
+    RenderCaptureSession, RenderFreezeSession,
 };
 pub use solid::{PointwiseSolidChangeHandler, PointwiseSolidEditError};
 use std::fmt;

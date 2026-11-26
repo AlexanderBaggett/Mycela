@@ -13,6 +13,7 @@ mod filter_stack;
 mod gradient_source;
 mod graph_document;
 mod gtx_import;
+mod image_file;
 mod input_source;
 mod live_invert;
 mod memory_capacity;

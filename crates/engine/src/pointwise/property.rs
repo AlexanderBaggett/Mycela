@@ -4124,7 +4124,7 @@ pub use capture::{
     EnvironmentRenderOverride, FrozenRenderBatch, FrozenRenderValues, MaterializedRenderBatch,
     PendingFilterRender, PendingGradientRender, PendingNodeRender, PendingThumbnailRender,
     PointwiseFinalExportCache, PointwiseNodeRenderSnapshot, PointwiseRenderSnapshot,
-    PointwiseThumbnailRender, RenderCaptureSession, RenderFreezeSession,
+    PointwiseSequenceRender, PointwiseThumbnailRender, RenderCaptureSession, RenderFreezeSession,
 };
 
 #[path = "retained_spatial.rs"]

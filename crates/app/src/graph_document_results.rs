@@ -121,7 +121,7 @@ impl ResultFrame {
 }
 
 #[derive(Clone, Copy)]
-enum RenderTarget {
+pub(super) enum RenderTarget {
     Texture,
     Selection,
 }
@@ -142,7 +142,7 @@ impl GraphDocumentView {
         guard(&self.document).branch(0).flatten()
     }
 
-    fn result_target(&self, target: RenderTarget) -> Option<Node> {
+    pub(super) fn result_target(&self, target: RenderTarget) -> Option<Node> {
         match target {
             RenderTarget::Texture => self.texture_output(),
             RenderTarget::Selection => self.selection_preview_target(),
@@ -157,7 +157,7 @@ impl GraphDocumentView {
         }
     }
 
-    fn result_source(&self, target: RenderTarget, node: &Node) -> String {
+    pub(super) fn result_source(&self, target: RenderTarget, node: &Node) -> String {
         let document = self.document_name();
         let label = match target {
             RenderTarget::Texture => {
@@ -523,6 +523,14 @@ impl GraphDocumentView {
             };
             (target, label, node.is_some())
         });
+        let sequence_choices = [RenderTarget::Texture, RenderTarget::Selection].map(|target| {
+            let label = format!("{} animation…", self.result_target_label(target));
+            (target, label, self.result_target(target).is_some())
+        });
+        let stop_available = self
+            .sequence_progress
+            .as_ref()
+            .is_some_and(|progress| progress.running());
         let export_available = !busy && !results_visible && self.preview_target().is_some();
         Button::new("graph-render-result")
             .label("Render")
@@ -541,6 +549,26 @@ impl GraphDocumentView {
                                 });
                             }),
                     );
+                }
+                menu = menu.separator();
+                for (target, label, available) in sequence_choices.iter().cloned() {
+                    let owner = owner.clone();
+                    menu = menu.item(
+                        PopupMenuItem::new(label)
+                            .disabled(busy || !available)
+                            .on_click(move |_, window, cx| {
+                                let _ = owner.update(cx, |view, cx| {
+                                    view.open_sequence(target, window, cx);
+                                });
+                            }),
+                    );
+                }
+                if stop_available {
+                    let owner = owner.clone();
+                    menu =
+                        menu.item(PopupMenuItem::new("Stop render").on_click(move |_, _, cx| {
+                            let _ = owner.update(cx, |view, cx| view.stop_sequence(cx));
+                        }));
                 }
                 menu.separator().item(
                     PopupMenuItem::new("Export preview image…")

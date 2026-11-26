@@ -357,6 +357,28 @@ pub(crate) fn render_thumbnail_sample(
     })
 }
 
+pub(crate) fn render_sequence_frame(
+    renderer: &mut mycela_engine::PointwiseSequenceRender<ForegroundError>,
+    time: f64,
+    geometry: mycela_engine::ImageGeometry,
+    devices: &mut PreviewDevices,
+    cancelled: &impl Fn() -> bool,
+    library: &mycela_engine::EnvironmentResourceLibrary,
+) -> Result<SharedImageMap, RenderError> {
+    let execution = crate::export_render::generator_execution();
+    let image = evaluate_with_devices(devices, cancelled, None, Some(library), |effects| {
+        renderer.render_frame(time, execution, effects)
+    })?
+    .still_image()
+    .ok_or_else(|| failure("The graph returned no frame at the requested time."))?;
+    let image = mycela_engine::downsample_render::<ForegroundError>(&image, geometry, execution)
+        .map_err(failure)?;
+    if cancelled() {
+        return Err(RenderError::Cancelled);
+    }
+    Ok(image)
+}
+
 pub(crate) fn render_export(
     snapshot: &PointwiseNodeRenderSnapshot<ForegroundError>,
     geometry: mycela_engine::ImageGeometry,

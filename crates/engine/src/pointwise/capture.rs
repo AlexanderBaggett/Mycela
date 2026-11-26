@@ -1480,7 +1480,62 @@ impl<E: 'static> PointwiseThumbnailRender<E> {
     }
 }
 
+/// A frozen final graph streamed at caller-selected animation times. Static
+/// raster results use the same bounded cache as final-quality playback.
+pub struct PointwiseSequenceRender<E = ()> {
+    snapshot: PointwiseNodeRenderSnapshot<E>,
+    graph: Option<crate::PointwiseFinalGraph<E>>,
+    geometry: crate::ImageGeometry,
+    options: PointwiseRenderOptions,
+    cache: super::super::graph::PlaybackImageCache,
+}
+
+impl<E: 'static> PointwiseSequenceRender<E> {
+    pub fn render_frame(
+        &mut self,
+        time: f64,
+        execution: crate::ProceduralExecution,
+        effects: &mut crate::PointwiseRenderEffects<'_, E>,
+    ) -> Result<crate::PointwiseRenderOutcome<E>, PointwiseError<E>> {
+        use crate::pointwise::graph::FinalImageReuse;
+        crate::pointwise::check_render_cancelled(effects.cancel_check())?;
+        match &self.graph {
+            Some(graph) => graph.render_frame(
+                self.geometry,
+                time,
+                execution,
+                self.options,
+                FinalImageReuse::Playback(&mut self.cache),
+                effects,
+            ),
+            None => self.snapshot.render_export_frame(
+                None,
+                self.geometry,
+                time,
+                execution,
+                self.options,
+                effects,
+            ),
+        }
+    }
+}
+
 impl<E: 'static> PointwiseNodeRenderSnapshot<E> {
+    pub fn prepare_sequence(
+        self,
+        geometry: crate::ImageGeometry,
+        options: PointwiseRenderOptions,
+    ) -> Result<PointwiseSequenceRender<E>, PointwiseError<E>> {
+        let graph = self.node.clone_supported_final_graph()?;
+        Ok(PointwiseSequenceRender {
+            snapshot: self,
+            graph,
+            geometry,
+            options,
+            cache: super::super::graph::PlaybackImageCache::new(),
+        })
+    }
+
     pub fn prepare_thumbnail(mut self) -> Result<PointwiseThumbnailRender<E>, PointwiseError<E>> {
         let graph = self.node.clone_supported_final_graph()?;
         let mut seen = std::collections::HashSet::new();
