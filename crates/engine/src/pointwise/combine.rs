@@ -1,13 +1,18 @@
 //! amm's retained three-input Combine. Source expression/array access order is
 //! intentional. This CPU seam does not invent the ambient za/oi memory policy.
-use super::combine_arrays::{Array, Pair, allocate, pair, required, reusable, screen};
+use super::combine_arrays::{
+    Array, Pair, allocate, compatible, map_dense, pair, required, reusable, screen,
+};
 use super::numeric::{add, approximately_one, div, mul, sub};
 use super::{
     HsbOperation, MapArrayOperation, PointwiseChannelGuarantees, PointwiseError, PointwiseFilter,
     PointwiseKind, PointwiseRenderOptions, SharedImageMap, combine_map_arrays, hsb_arrays,
     interpolate_map_arrays,
 };
-use crate::{FloatBuffer, ImageError, ImageGeometry, SharedFloatStore, SharedNamedChannel};
+use crate::{
+    FloatBuffer, ImageError, ImageGeometry, ProceduralExecution, SharedFloatStore,
+    SharedNamedChannel,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CombineColorOperation {
@@ -220,6 +225,7 @@ fn complex(
     mode: Option<&[u16]>,
     top: &[Array],
     bottom: &[Array],
+    execution: ProceduralExecution,
 ) -> Result<[Array; 3], ImageError> {
     let t: [Array; 3] = std::array::from_fn(|i| top[i].clone());
     let b: [Array; 3] = std::array::from_fn(|i| bottom[i].clone());
@@ -230,6 +236,7 @@ fn complex(
             component(&b, 2)?.as_ref(),
             a[2].as_ref(),
             None,
+            execution,
         )?;
         return hsb(a, HsbOperation::HsbToRgb);
     }
@@ -272,15 +279,16 @@ fn scalar_blend(
     alpha: Option<&FloatBuffer>,
     top: Option<&FloatBuffer>,
     bottom: Option<&FloatBuffer>,
+    execution: ProceduralExecution,
 ) -> Result<Array, ImageError> {
     let transformed = if equals(mode, "Add") {
-        pair(Pair::Add, top, bottom, None)?
+        pair(Pair::Add, top, bottom, None, execution)?
     } else if equals(mode, "Subtract") {
         combine_map_arrays(MapArrayOperation::Subtract, bottom, top)?
     } else if equals(mode, "Multiply") {
-        pair(Pair::Multiply, top, bottom, None)?
+        pair(Pair::Multiply, top, bottom, None, execution)?
     } else if equals(mode, "Divide") {
-        pair(Pair::Divide, top, bottom, None)?
+        pair(Pair::Divide, top, bottom, None, execution)?
     } else if equals(mode, "Difference") {
         combine_map_arrays(MapArrayOperation::Difference, top, bottom)?
     } else if equals(mode, "Negate") {
@@ -290,7 +298,7 @@ fn scalar_blend(
     } else if equals(mode, "Least") {
         combine_map_arrays(MapArrayOperation::Least, top, bottom)?
     } else if equals(mode, "Screen") {
-        screen(top, bottom)?
+        screen(top, bottom, execution)?
     } else {
         Some(FloatBuffer::new(Vec::new()))
     };
@@ -300,9 +308,16 @@ fn scalar_blend(
         alpha,
         transformed.as_ref(),
         preferred.as_ref(),
+        execution,
     )?;
-    let b = pair(Pair::Multiply, bottom, alpha, None)?;
-    pair(Pair::Add, a.as_ref(), b.as_ref(), preferred.as_ref())
+    let b = pair(Pair::Multiply, bottom, alpha, None, execution)?;
+    pair(
+        Pair::Add,
+        a.as_ref(),
+        b.as_ref(),
+        preferred.as_ref(),
+        execution,
+    )
 }
 fn normal(
     alpha: Option<&FloatBuffer>,
@@ -310,23 +325,37 @@ fn normal(
     divisor: Option<&FloatBuffer>,
     top: Option<&FloatBuffer>,
     bottom: Option<&FloatBuffer>,
+    execution: ProceduralExecution,
 ) -> Result<Array, ImageError> {
-    let a = pair(Pair::Inverse, alpha, top, None)?;
+    let a = pair(Pair::Inverse, alpha, top, None, execution)?;
     let preferred = reusable(a.as_ref(), alpha, top);
-    let b = pair(Pair::Multiply, bottom, alpha, None)?;
+    let b = pair(Pair::Multiply, bottom, alpha, None, execution)?;
     let b_preferred = reusable(b.as_ref(), bottom, alpha);
     let c = pair(
         Pair::Inverse,
         bottom_alpha,
         b.as_ref(),
         b_preferred.as_ref(),
+        execution,
     )?;
-    let sum = pair(Pair::Add, a.as_ref(), c.as_ref(), preferred.as_ref())?;
+    let sum = pair(
+        Pair::Add,
+        a.as_ref(),
+        c.as_ref(),
+        preferred.as_ref(),
+        execution,
+    )?;
     let division_preferred = sum.as_ref().filter(|sum| {
         !c.as_ref().is_some_and(|v| sum.shares_storage(v))
             && !(a.as_ref().is_some_and(|v| sum.shares_storage(v)) && preferred.is_none())
     });
-    pair(Pair::Divide, sum.as_ref(), divisor, division_preferred)
+    pair(
+        Pair::Divide,
+        sum.as_ref(),
+        divisor,
+        division_preferred,
+        execution,
+    )
 }
 #[allow(clippy::too_many_arguments)]
 fn blend_channel(
@@ -337,14 +366,15 @@ fn blend_channel(
     divisor: Option<&FloatBuffer>,
     top: Option<&FloatBuffer>,
     bottom: Option<&FloatBuffer>,
+    execution: ProceduralExecution,
 ) -> Result<Array, ImageError> {
     if equals(mode, "Normal") {
-        normal(alpha, bottom_alpha, divisor, top, bottom)
+        normal(alpha, bottom_alpha, divisor, top, bottom, execution)
     } else if equals(mode, "Backlit") {
-        let product = pair(Pair::Multiply, bottom, alpha, None)?;
-        pair(Pair::Add, top, product.as_ref(), None)
+        let product = pair(Pair::Multiply, bottom, alpha, None, execution)?;
+        pair(Pair::Add, top, product.as_ref(), None, execution)
     } else if mode_index < 10 || equals(mode, "Screen") {
-        scalar_blend(mode, alpha, top, bottom)
+        scalar_blend(mode, alpha, top, bottom, execution)
     } else {
         interpolate_map_arrays(top, bottom, 0.5, None).map(Some)
     }
@@ -353,6 +383,7 @@ fn effective_alpha(
     top: FloatBuffer,
     selector: Array,
     inverse_opacity: f32,
+    execution: ProceduralExecution,
 ) -> Result<FloatBuffer, ImageError> {
     let mut alpha = top;
     if let Some(selector) = selector {
@@ -360,7 +391,11 @@ fn effective_alpha(
             alpha = selector;
         } else {
             let out = allocate(selector.len().max(alpha.len()), None)?;
-            if selector.len() == 1 && alpha.len() == 1 {
+            if compatible(out.len(), &[alpha.len(), selector.len()]) {
+                map_dense(&out, &alpha, &selector, execution, |x, s| {
+                    add(x, mul(sub(1.0, x), s))
+                })?;
+            } else if selector.len() == 1 && alpha.len() == 1 {
                 let x = alpha.read(0)?;
                 out.write(0, add(x, mul(sub(1.0, x), selector.read(0)?)))?;
             } else if selector.len() == 1 && alpha.len() > 1 {
@@ -386,9 +421,14 @@ fn effective_alpha(
     }
     if inverse_opacity != 0.0 {
         let out = allocate(alpha.len(), None)?;
-        for i in 0..out.len() {
-            let x = alpha.read(i)?;
-            out.write(i, add(x, mul(sub(1.0, x), inverse_opacity)))?;
+        let opacity = |x, opacity| add(x, mul(sub(1., x), opacity));
+        if out.len() > 1 {
+            let amount = FloatBuffer::new(vec![inverse_opacity]);
+            map_dense(&out, &alpha, &amount, execution, opacity)?;
+        } else {
+            for i in 0..out.len() {
+                out.write(i, opacity(alpha.read(i)?, inverse_opacity))?;
+            }
         }
         alpha = out;
     }
@@ -404,6 +444,7 @@ fn normalize_selector(selector: FloatBuffer) -> Result<Array, ImageError> {
 struct CombineSettings<'a, E> {
     filter: &'a PointwiseFilter<E>,
     time: Option<f64>,
+    execution: ProceduralExecution,
     cancelled: &'a dyn Fn() -> bool,
 }
 
@@ -577,6 +618,7 @@ impl<E> PointwiseFilter<E> {
             &CombineSettings {
                 filter: self,
                 time: None,
+                execution: ProceduralExecution::CallingThread,
                 cancelled: &|| false,
             },
             top.as_ref(),
@@ -606,11 +648,11 @@ impl<E> PointwiseFilter<E> {
         render(
             self,
             inputs,
-            width,
-            height,
+            ImageGeometry::new(width, height),
             options,
             Some(capacity_available),
             None,
+            ProceduralExecution::CallingThread,
         )
     }
 }
@@ -746,31 +788,34 @@ enum CapacitySource<'a, E> {
 pub(super) fn render<E: 'static>(
     filter: &PointwiseFilter<E>,
     inputs: &[Option<SharedImageMap>],
-    width: i32,
-    height: i32,
+    geometry: ImageGeometry,
     options: PointwiseRenderOptions,
     capacity: Option<bool>,
     time: Option<f64>,
+    execution: ProceduralExecution,
 ) -> Result<Option<SharedImageMap>, PointwiseError<E>> {
     render_with_capacity_source(
         &CombineSettings {
             filter,
             time,
+            execution,
             cancelled: &|| false,
         },
         inputs,
-        width,
-        height,
+        geometry.width(),
+        geometry.height(),
         options,
         CapacitySource::Fixed(capacity),
     )
 }
+#[allow(clippy::too_many_arguments)]
 pub(super) fn render_with_capacity_query<E: 'static>(
     filter: &PointwiseFilter<E>,
     inputs: &[Option<SharedImageMap>],
     geometry: ImageGeometry,
     options: PointwiseRenderOptions,
     time: Option<f64>,
+    execution: ProceduralExecution,
     query: &mut dyn FnMut(i32) -> Result<bool, PointwiseError<E>>,
     cancelled: &dyn Fn() -> bool,
 ) -> Result<Option<SharedImageMap>, PointwiseError<E>> {
@@ -778,6 +823,7 @@ pub(super) fn render_with_capacity_query<E: 'static>(
         &CombineSettings {
             filter,
             time,
+            execution,
             cancelled,
         },
         inputs,
@@ -901,20 +947,32 @@ fn arrays<E: 'static>(
     let n = top.len().min(bottom.len()).max(3);
     let mut out = vec![None; n.max(4)];
     let inverse_opacity = sub(1.0, settings.opacity()?);
-    let alpha = effective_alpha(raw_top.clone(), selector.clone(), inverse_opacity)?;
+    let alpha = effective_alpha(
+        raw_top.clone(),
+        selector.clone(),
+        inverse_opacity,
+        settings.execution,
+    )?;
     if equals(mode, "Normal")
         || equals(mode, "Backlit")
         || mode_index < 10
         || equals(mode, "Screen")
     {
         let divisor = if equals(mode, "Normal") {
-            let intermediate = pair(Pair::Inverse, Some(&raw_bottom), Some(&alpha), None)?;
+            let intermediate = pair(
+                Pair::Inverse,
+                Some(&raw_bottom),
+                Some(&alpha),
+                None,
+                settings.execution,
+            )?;
             let preferred = reusable(intermediate.as_ref(), Some(&raw_bottom), Some(&alpha));
             pair(
                 Pair::ComplementAdd,
                 Some(&alpha),
                 intermediate.as_ref(),
                 preferred.as_ref(),
+                settings.execution,
             )?
         } else {
             None
@@ -930,17 +988,36 @@ fn arrays<E: 'static>(
                     divisor.as_ref(),
                     top[ch].as_ref(),
                     bottom[ch].as_ref(),
+                    settings.execution,
                 )?;
             }
         }
     } else {
-        let transformed = complex(mode, top, bottom)?;
+        let transformed = complex(mode, top, bottom, settings.execution)?;
         for (ch, destination) in out.iter_mut().take(3).enumerate() {
             super::check_render_cancelled(settings.cancelled)?;
-            let a = pair(Pair::Inverse, Some(&alpha), transformed[ch].as_ref(), None)?;
-            let b = pair(Pair::Multiply, bottom[ch].as_ref(), Some(&alpha), None)?;
+            let a = pair(
+                Pair::Inverse,
+                Some(&alpha),
+                transformed[ch].as_ref(),
+                None,
+                settings.execution,
+            )?;
+            let b = pair(
+                Pair::Multiply,
+                bottom[ch].as_ref(),
+                Some(&alpha),
+                None,
+                settings.execution,
+            )?;
             let preferred = reusable(a.as_ref(), Some(&alpha), transformed[ch].as_ref());
-            *destination = pair(Pair::Add, a.as_ref(), b.as_ref(), preferred.as_ref())?;
+            *destination = pair(
+                Pair::Add,
+                a.as_ref(),
+                b.as_ref(),
+                preferred.as_ref(),
+                settings.execution,
+            )?;
         }
         for (ch, destination) in out.iter_mut().take(n).enumerate().skip(4) {
             super::check_render_cancelled(settings.cancelled)?;
@@ -1142,7 +1219,7 @@ fn transparency<E: 'static>(
         }
         Ok(Some(out))
     } else if equals(mode, "Product") {
-        Ok(pair(Pair::Multiply, top, bottom, None)?)
+        Ok(pair(Pair::Multiply, top, bottom, None, settings.execution)?)
     } else if equals(mode, "Greatest") {
         Ok(combine_map_arrays(
             MapArrayOperation::Greatest,
@@ -1150,7 +1227,7 @@ fn transparency<E: 'static>(
             bottom,
         )?)
     } else if equals(mode, "Sum") {
-        Ok(pair(Pair::Add, top, bottom, None)?)
+        Ok(pair(Pair::Add, top, bottom, None, settings.execution)?)
     } else if equals(mode, "Top") {
         Ok(top.cloned())
     } else if equals(mode, "Bottom") {
@@ -1182,15 +1259,22 @@ fn named_and_alpha<E: 'static>(
         .min(bottom.named_channels().len());
     if effects && n > 0 {
         let inverse_opacity = sub(1.0, settings.opacity()?);
-        let alpha = effective_alpha(raw_top, s, inverse_opacity)?;
+        let alpha = effective_alpha(raw_top, s, inverse_opacity, settings.execution)?;
         let divisor = if equals(mode, "Normal") {
-            let intermediate = pair(Pair::Inverse, Some(&raw_bottom), Some(&alpha), None)?;
+            let intermediate = pair(
+                Pair::Inverse,
+                Some(&raw_bottom),
+                Some(&alpha),
+                None,
+                settings.execution,
+            )?;
             let preferred = reusable(intermediate.as_ref(), Some(&raw_bottom), Some(&alpha));
             pair(
                 Pair::ComplementAdd,
                 Some(&alpha),
                 intermediate.as_ref(),
                 preferred.as_ref(),
+                settings.execution,
             )?
         } else {
             None
@@ -1217,6 +1301,7 @@ fn named_and_alpha<E: 'static>(
                 divisor.as_ref(),
                 Some(&a),
                 Some(&b),
+                settings.execution,
             )?;
             let name = top
                 .named_channel(ch as i32)?

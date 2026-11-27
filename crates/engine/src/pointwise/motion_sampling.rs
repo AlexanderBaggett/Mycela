@@ -72,23 +72,59 @@ fn sample_from<E>(
     seamless: bool,
     read: impl Fn(i32) -> Result<f32, ImageError>,
 ) -> Result<f32, PointwiseError<E>> {
-    let (x0, x1, fx) = if seamless {
-        wrapped(x, width)?
-    } else {
-        clamped(x, width)
-    };
-    let (y0, y1, fy) = if seamless {
-        wrapped(y, height)?
-    } else {
-        clamped(y, height)
-    };
-    let y0 = y0.wrapping_mul(width);
-    let y1 = y1.wrapping_mul(width);
-    let tl = read(x0.wrapping_add(y0))?;
-    let tr = read(x1.wrapping_add(y0))?;
-    let top = add(tl, mul(fx, sub(tr, tl)));
-    let bl = read(x0.wrapping_add(y1))?;
-    let br = read(x1.wrapping_add(y1))?;
-    let bottom = add(bl, mul(fx, sub(br, bl)));
-    Ok(add(top, mul(fy, sub(bottom, top))))
+    Ok(BilinearTaps::new(x, y, width, height, seamless)?.read(read)?)
+}
+
+pub(super) struct BilinearTaps {
+    indices: [i32; 4],
+    fx: f32,
+    fy: f32,
+}
+
+impl BilinearTaps {
+    pub(super) fn new<E>(
+        x: f32,
+        y: f32,
+        width: i32,
+        height: i32,
+        seamless: bool,
+    ) -> Result<Self, PointwiseError<E>> {
+        let (x0, x1, fx) = if seamless {
+            wrapped(x, width)?
+        } else {
+            clamped(x, width)
+        };
+        let (y0, y1, fy) = if seamless {
+            wrapped(y, height)?
+        } else {
+            clamped(y, height)
+        };
+        let y0 = y0.wrapping_mul(width);
+        let y1 = y1.wrapping_mul(width);
+        Ok(Self {
+            indices: [
+                x0.wrapping_add(y0),
+                x1.wrapping_add(y0),
+                x0.wrapping_add(y1),
+                x1.wrapping_add(y1),
+            ],
+            fx,
+            fy,
+        })
+    }
+
+    pub(super) fn sample_pixels(&self, source: &[f32]) -> Result<f32, ImageError> {
+        self.read(|index| read_pixel(source, index))
+    }
+
+    fn read(&self, read: impl Fn(i32) -> Result<f32, ImageError>) -> Result<f32, ImageError> {
+        let [tl, tr, bl, br] = self.indices;
+        let tl = read(tl)?;
+        let tr = read(tr)?;
+        let top = add(tl, mul(self.fx, sub(tr, tl)));
+        let bl = read(bl)?;
+        let br = read(br)?;
+        let bottom = add(bl, mul(self.fx, sub(br, bl)));
+        Ok(add(top, mul(self.fy, sub(bottom, top))))
+    }
 }

@@ -3,9 +3,9 @@
 //! TexTree i1 060029cd/ce; av9 060029da/db. Source parity is not established by
 //! the static laws in this module's test companion.
 use crate::framework_cast::integer;
-use crate::procedural_schedule::chunks;
-use crate::procedural_sites::{SiteGrid, SiteGridExecution, SiteGridOptions, build_grid};
-use crate::{FloatBuffer, ImageGeometry, PointwiseError, SharedImageMap};
+use crate::procedural_schedule::{chunks, for_each_dense_band};
+use crate::procedural_sites::{Site, SiteGrid, SiteGridExecution, SiteGridOptions, build_grid};
+use crate::{FloatBuffer, ImageError, ImageGeometry, PointwiseError, SharedImageMap};
 
 const CELLS_TEXT: &[u16] = &[67, 101, 108, 108, 115];
 
@@ -218,12 +218,91 @@ pub(crate) fn render_cells_with_inputs<'a, E>(
         grid.span[0] / geometry.width() as f32,
         grid.span[1] / geometry.height() as f32,
     ];
-    for (start, count) in chunks(geometry.area(), options.execution)? {
-        render_cells_chunk(
-            &output, &grid, geometry, scale, metric, result, normalizer, start, count,
-        )?;
+    // Retain the scheduler's validation before entering the independent raster pass.
+    let schedule = chunks::<E>(geometry.area(), options.execution)?;
+    if geometry.width() <= 0
+        || geometry.height() <= 0
+        || geometry
+            .width()
+            .checked_mul(geometry.height())
+            .map(|area| area as usize)
+            != Some(output.len())
+    {
+        for (start, count) in schedule {
+            render_cells_chunk(
+                &output, &grid, geometry, scale, metric, result, normalizer, start, count,
+            )?;
+        }
+        return Ok(image);
     }
+    let [grid_width, grid_height, _] = grid.dimensions();
+    let width = geometry.width() as usize;
+    let height = f64::from(geometry.height());
+    let column = |x: usize| {
+        let gx = integer(x as f64 / width as f64 * f64::from(grid_width));
+        (gx, x as f32 * scale[0])
+    };
+    let mut columns = Vec::new();
+    columns
+        .try_reserve_exact(width)
+        .map_err(|_| ImageError::Allocation)?;
+    columns.extend((0..width).map(column));
+    output.with_mut_slice(|pixels| {
+        for_each_dense_band(pixels, width, options.execution, |start, band| {
+            for (offset, row) in band.chunks_exact_mut(width).enumerate() {
+                let y = start + offset;
+                let grid_y = integer(y as f64 / height * f64::from(grid_height));
+                let sample_y = y as f32 * scale[1];
+                for (pixel, &(grid_x, sample_x)) in row.iter_mut().zip(&columns) {
+                    *pixel = cell_value(
+                        grid.cell_sites(grid_x, grid_y)?,
+                        sample_x,
+                        sample_y,
+                        metric,
+                        result,
+                        normalizer,
+                    );
+                }
+            }
+            Ok(())
+        })
+    })?;
     Ok(image)
+}
+
+fn cell_value(
+    sites: impl Iterator<Item = Site>,
+    x: f32,
+    y: f32,
+    metric: i32,
+    result: i32,
+    normalizer: f32,
+) -> f32 {
+    let mut first = f32::MAX;
+    let mut second = f32::MAX;
+    for site in sites {
+        let distance = match metric {
+            1 => site.squared_distance(x, y),
+            2 => site.manhattan_distance(x, y),
+            _ => site.maximum_distance(x, y),
+        };
+        if distance < first {
+            second = first;
+            first = distance;
+        } else if distance < second {
+            second = distance;
+        }
+    }
+    if metric == 1 {
+        first = libm::sqrt(f64::from(first)) as f32;
+        second = libm::sqrt(f64::from(second)) as f32;
+    }
+    match result {
+        1 => 1.0 - first / second,
+        2 => 1.0 - (first + second) * normalizer,
+        3 => 1.0 - first * 0.07,
+        _ => 1.0 - second * 0.07,
+    }
 }
 
 #[allow(clippy::too_many_arguments)]

@@ -928,6 +928,7 @@ impl<E: 'static> PointwiseFilter<E> {
                 ImageGeometry::new(width, height),
                 options,
                 None,
+                crate::ProceduralExecution::CallingThread,
                 query,
                 &|| false,
             );
@@ -1118,9 +1119,15 @@ impl<E: 'static> PointwiseFilter<E> {
                 0.0,
                 crate::ProceduralExecution::CallingThread,
             ),
-            PointwiseKind::Combine => {
-                super::combine::render(self, inputs, width, height, options, None, None)
-            }
+            PointwiseKind::Combine => super::combine::render(
+                self,
+                inputs,
+                ImageGeometry::new(width, height),
+                options,
+                None,
+                None,
+                crate::ProceduralExecution::CallingThread,
+            ),
             PointwiseKind::ToneCurve => {
                 super::tone_curve::render(self, inputs, width, height, None)
             }
@@ -2153,6 +2160,7 @@ impl<E: 'static> PointwiseFilter<E> {
                 ImageGeometry::new(width, height),
                 options,
                 Some(time),
+                execution,
                 effects.capacity,
                 cancelled,
             );
@@ -2281,7 +2289,15 @@ impl<E: 'static> PointwiseFilter<E> {
             );
         }
         if self.kind() == PointwiseKind::Combine {
-            return super::combine::render(self, inputs, width, height, options, None, Some(time));
+            return super::combine::render(
+                self,
+                inputs,
+                ImageGeometry::new(width, height),
+                options,
+                None,
+                Some(time),
+                execution,
+            );
         }
         if self.kind() == PointwiseKind::ToneCurve {
             return super::tone_curve::render(self, inputs, width, height, Some(time));
@@ -2693,6 +2709,7 @@ impl<E: 'static> PointwiseFilter<E> {
                 ImageGeometry::new(width, height),
                 options,
                 Some(time),
+                execution,
                 query,
                 &|| false,
             )

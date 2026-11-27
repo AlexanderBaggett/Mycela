@@ -140,6 +140,19 @@ impl SiteGrid {
                 + rank as usize,
         )
     }
+    pub(crate) fn cell_sites(
+        &self,
+        x: i32,
+        y: i32,
+    ) -> Result<impl Iterator<Item = Site> + '_, ImageError> {
+        let depth = self.dimensions[2] as usize;
+        let first = if depth == 0 { 0 } else { self.offset(x, y, 0)? };
+        let end = first + depth;
+        Ok(self.candidates[first..end]
+            .iter()
+            .map_while(|id| id.map(|id| self.sites[id.0])))
+    }
+
     pub(crate) fn candidate(&self, x: i32, y: i32, rank: i32) -> Result<Option<Site>, ImageError> {
         Ok(self.candidates[self.offset(x, y, rank)?].map(|id| self.sites[id.0]))
     }
