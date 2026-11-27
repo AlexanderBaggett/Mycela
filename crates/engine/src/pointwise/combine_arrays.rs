@@ -97,6 +97,37 @@ pub(super) fn pair(
         _ => {}
     }
     let out = allocate(na.max(nb), preferred)?;
+    if na > 0
+        && nb > 0
+        && na.max(nb) > 1
+        && (na == 1 || nb == 1 || na == nb)
+        && !out.shares_storage(a)
+        && !out.shares_storage(b)
+    {
+        let a = a.shared_values();
+        let b = b.shared_values();
+        out.with_mut_slice(|pixels| match (na, nb) {
+            (1, _) => {
+                let x = a[0];
+                for (out, &y) in pixels.iter_mut().zip(b.iter()) {
+                    *out = scalar_first(op, x, y);
+                }
+            }
+            (_, 1) => {
+                let y = b[0];
+                let reciprocal = div(1.0, y);
+                for (out, &x) in pixels.iter_mut().zip(a.iter()) {
+                    *out = scalar_second(op, x, y, reciprocal);
+                }
+            }
+            _ => {
+                for ((out, &x), &y) in pixels.iter_mut().zip(a.iter()).zip(b.iter()) {
+                    *out = dense_pair(op, x, y);
+                }
+            }
+        });
+        return Ok(Some(out));
+    }
     if na == 1 && nb == 1 {
         let x = a.read(0)?;
         let y = b.read(0)?;
@@ -123,66 +154,70 @@ pub(super) fn pair(
         let n = if matches!(op, Divide) { out.len() } else { nb };
         for i in 0..n {
             let y = b.read(i)?;
-            let v = match op {
-                Add => scalar_add(y, x),
-                Multiply => scalar_mul(y, x),
-                Inverse => scalar_mul(y, sub(1.0, x)),
-                ComplementAdd => scalar_add(y, sub(1.0, x)),
-                Divide => {
-                    if y > 0.0 || y < -0.0 {
-                        div(x, y)
-                    } else {
-                        signed_limit(x)
-                    }
-                }
-            };
-            out.write(i, v)?;
+            out.write(i, scalar_first(op, x, y))?;
         }
     } else if na > 1 && nb == 1 {
         let y = b.read(0)?;
         let reciprocal = div(1.0, y);
         for i in 0..na {
             let x = a.read(i)?;
-            let v = match op {
-                Add => scalar_add(x, y),
-                Multiply => scalar_mul(x, y),
-                Inverse => mul(sub(1.0, x), y),
-                ComplementAdd => add(sub(1.0, x), y),
-                Divide => {
-                    if y > 0.0 || y < -0.0 {
-                        mul(x, reciprocal)
-                    } else {
-                        signed_limit(x)
-                    }
-                }
-            };
-            out.write(i, v)?;
+            out.write(i, scalar_second(op, x, y, reciprocal))?;
         }
     } else if na > 1 && nb > 1 {
         for i in 0..na {
             // bw reads denominator before numerator; other workers read first.
             let v = if matches!(op, Divide) {
                 let y = b.read(i)?;
-                if y > 0.0 || y < -0.0 {
-                    div(a.read(i)?, y)
-                } else {
-                    signed_limit(a.read(i)?)
-                }
+                dense_pair(op, a.read(i)?, y)
             } else {
                 let x = a.read(i)?;
-                let y = b.read(i)?;
-                match op {
-                    Add => add(x, y),
-                    Multiply => mul(x, y),
-                    Inverse => mul(sub(1.0, x), y),
-                    ComplementAdd => add(sub(1.0, x), y),
-                    Divide => unreachable!(),
-                }
+                dense_pair(op, x, b.read(i)?)
             };
             out.write(i, v)?;
         }
     }
     Ok(Some(out))
+}
+fn scalar_first(op: Pair, x: f32, y: f32) -> f32 {
+    match op {
+        Pair::Add => scalar_add(y, x),
+        Pair::Multiply => scalar_mul(y, x),
+        Pair::Inverse => scalar_mul(y, sub(1.0, x)),
+        Pair::ComplementAdd => scalar_add(y, sub(1.0, x)),
+        Pair::Divide => dense_pair(op, x, y),
+    }
+}
+
+fn scalar_second(op: Pair, x: f32, y: f32, reciprocal: f32) -> f32 {
+    match op {
+        Pair::Add => scalar_add(x, y),
+        Pair::Multiply => scalar_mul(x, y),
+        Pair::Inverse => mul(sub(1.0, x), y),
+        Pair::ComplementAdd => add(sub(1.0, x), y),
+        Pair::Divide => {
+            if y > 0.0 || y < -0.0 {
+                mul(x, reciprocal)
+            } else {
+                signed_limit(x)
+            }
+        }
+    }
+}
+
+fn dense_pair(op: Pair, x: f32, y: f32) -> f32 {
+    match op {
+        Pair::Add => add(x, y),
+        Pair::Multiply => mul(x, y),
+        Pair::Inverse => mul(sub(1.0, x), y),
+        Pair::ComplementAdd => add(sub(1.0, x), y),
+        Pair::Divide => {
+            if y > 0.0 || y < -0.0 {
+                div(x, y)
+            } else {
+                signed_limit(x)
+            }
+        }
+    }
 }
 /// amm.h, distinct from r7's algebraically equivalent screen expression.
 pub(super) fn screen(

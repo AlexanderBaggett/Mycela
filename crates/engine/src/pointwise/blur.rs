@@ -4,7 +4,7 @@ use super::numeric::{add, mul, sub};
 use super::{
     PointwiseError, PointwiseFilter, PointwiseKind, PointwiseRenderEffects, SharedImageMap,
 };
-use crate::procedural_schedule::{for_each_chunk, for_each_row_chunk};
+use crate::procedural_schedule::{for_each_chunk, for_each_dense_band, for_each_row_chunk};
 use crate::source_float::{first_nan, ordered_add};
 use crate::{
     FloatBuffer, ImageError, ImageGeometry, ProceduralExecution,
@@ -207,6 +207,124 @@ impl LineJob<'_> {
             Axis::Column => line.wrapping_add(position.wrapping_mul(self.width)),
         }
     }
+    fn apply<E>(
+        &self,
+        pixels: &mut [f32],
+        execution: ProceduralExecution,
+    ) -> Result<(), PointwiseError<E>> {
+        let (lines, extent) = match self.axis {
+            Axis::Row => (self.height, self.width),
+            Axis::Column => (self.width, self.height),
+        };
+        let area = self
+            .width
+            .checked_mul(self.height)
+            .and_then(|n| usize::try_from(n).ok());
+        if lines > 0
+            && extent > 0
+            && (0..extent).contains(&self.radius)
+            && area == Some(pixels.len())
+            && area == Some(self.source.len())
+            && !matches!(
+                execution,
+                ProceduralExecution::WorkerPool {
+                    processor_count: ..=0
+                }
+            )
+        {
+            let width = self.width as usize;
+            let radius = self.radius as usize;
+            match self.axis {
+                Axis::Row => for_each_dense_band(pixels, width, execution, |start, band| {
+                    let source_start = start * width;
+                    for (out, source) in band
+                        .chunks_exact_mut(width)
+                        .zip(self.source[source_start..].chunks_exact(width))
+                    {
+                        self.blur_row(source, out, radius);
+                    }
+                    Ok(())
+                })?,
+                Axis::Column => self.blur_columns(pixels, width, radius)?,
+            }
+            Ok(())
+        } else {
+            for_each_row_chunk(lines, execution, |start, count| {
+                self.run(start, count, pixels)
+            })
+        }
+    }
+
+    fn blur_row(&self, source: &[f32], pixels: &mut [f32], radius: usize) {
+        let extent = source.len();
+        let mut sum = if self.periodic {
+            source[extent - radius..]
+                .iter()
+                .copied()
+                .fold(0., |sum, value| ordered_add(sum, f64::from(value)))
+        } else {
+            f64::from(mul(source[0], radius as f32))
+        };
+        for &value in &source[..=radius] {
+            sum = ordered_add(sum, f64::from(value));
+        }
+        sum = box_mul64(sum, self.reciprocal);
+        pixels[0] = sum as f32;
+        for (position, target) in pixels.iter_mut().enumerate().skip(1) {
+            let (outgoing, incoming) = window_edges(position, extent, radius, self.periodic);
+            let delta = add(-source[outgoing], source[incoming]);
+            sum = ordered_add(sum, box_mul64(f64::from(delta), self.reciprocal));
+            *target = sum as f32;
+        }
+    }
+
+    fn blur_columns(
+        &self,
+        pixels: &mut [f32],
+        width: usize,
+        radius: usize,
+    ) -> Result<(), ImageError> {
+        // A row-major sweep carries each column's previous Double sum.
+        // Independent columns retain the original recurrence and tap order.
+        let height = self.height as usize;
+        let mut sums = doubles(self.width)?;
+        let source_row = |row| &self.source[row * width..(row + 1) * width];
+        if self.periodic {
+            for row in height - radius..height {
+                for (sum, &value) in sums.iter_mut().zip(source_row(row)) {
+                    *sum = ordered_add(*sum, f64::from(value));
+                }
+            }
+        } else {
+            for (sum, &value) in sums.iter_mut().zip(source_row(0)) {
+                *sum = f64::from(mul(value, radius as f32));
+            }
+        }
+        for row in 0..=radius {
+            for (sum, &value) in sums.iter_mut().zip(source_row(row)) {
+                *sum = ordered_add(*sum, f64::from(value));
+            }
+        }
+        for (target, sum) in pixels[..width].iter_mut().zip(&mut sums) {
+            *sum = box_mul64(*sum, self.reciprocal);
+            *target = *sum as f32;
+        }
+        for (index, row) in pixels.chunks_exact_mut(width).enumerate().skip(1) {
+            let (outgoing, incoming) = window_edges(index, height, radius, self.periodic);
+            for (((target, sum), &previous), &next) in row
+                .iter_mut()
+                .zip(&mut sums)
+                .zip(source_row(outgoing))
+                .zip(source_row(incoming))
+            {
+                let delta = add(-previous, next);
+                *sum = ordered_add(*sum, box_mul64(f64::from(delta), self.reciprocal));
+                *target = *sum as f32;
+            }
+        }
+        Ok(())
+    }
+
     fn run<E>(&self, start: i32, count: i32, pixels: &mut [f32]) -> Result<(), PointwiseError<E>> {
         let extent = match self.axis {
             Axis::Row => self.width,
@@ -283,6 +401,25 @@ impl LineJob<'_> {
         Ok(())
     }
 }
+fn window_edges(position: usize, extent: usize, radius: usize, periodic: bool) -> (usize, usize) {
+    let outgoing = position.checked_sub(radius + 1).unwrap_or_else(|| {
+        if periodic {
+            position + extent - radius - 1
+        } else {
+            0
+        }
+    });
+    let incoming = position + radius;
+    let incoming = if incoming < extent {
+        incoming
+    } else if periodic {
+        incoming - extent
+    } else {
+        extent - 1
+    };
+    (outgoing, incoming)
+}
+
 #[derive(Clone, Copy)]
 struct BoxSettings {
     horizontal: bool,
@@ -349,11 +486,7 @@ fn box_pass<E>(
                     periodic: s.periodic,
                     axis: Axis::Row,
                 };
-                dest.with_mut_slice(|pixels| {
-                    for_each_row_chunk::<E>(h, execution, |start, count| {
-                        job.run(start, count, pixels)
-                    })
-                })?;
+                dest.with_mut_slice(|pixels| job.apply::<E>(pixels, execution))?;
                 drop(values);
                 if s.vertical {
                     if scratch.is_none() {
@@ -375,11 +508,7 @@ fn box_pass<E>(
                     periodic: s.periodic,
                     axis: Axis::Column,
                 };
-                dest.with_mut_slice(|pixels| {
-                    for_each_row_chunk::<E>(w, execution, |start, count| {
-                        job.run(start, count, pixels)
-                    })
-                })?;
+                dest.with_mut_slice(|pixels| job.apply::<E>(pixels, execution))?;
                 drop(values);
             }
         }

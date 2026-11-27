@@ -784,6 +784,39 @@ fn get<E>(
 fn required<E>(input: Option<SharedImageMap>) -> Result<SharedImageMap, PointwiseError<E>> {
     input.ok_or(PointwiseError::NullReference)
 }
+/// The three adjustments are independent across pixels. Preserve operand
+/// order and the source's exact constant and out-of-range decisions.
+fn adjust_bci_plane(
+    source: &[f32],
+    output: &mut [f32],
+    brightness: f32,
+    contrast: f32,
+    intensity: f32,
+) -> Option<f32> {
+    use super::numeric::scalar_add;
+
+    let adjust = |mut value| {
+        if brightness != 0.0 {
+            value = scalar_add(value, brightness);
+        }
+        if contrast != 0.0 {
+            value = add(value, mul(sub(value, 0.5), contrast));
+        }
+        if intensity != 0.0 {
+            value = add(value, mul(value, intensity));
+        }
+        value
+    };
+    let first = max32(0., min32(1., adjust(source[0])));
+    let mut constant = true;
+    for (target, &value) in output.iter_mut().zip(source) {
+        let value = adjust(value).clamp(0., 1.);
+        *target = value;
+        constant &= value == first;
+    }
+    constant.then_some(first)
+}
+
 fn copy(source: &FloatBuffer, destination: &FloatBuffer, length: usize) -> Result<(), ImageError> {
     if source.len() < length || destination.len() < length {
         return Err(ImageError::Argument);
@@ -1390,7 +1423,7 @@ impl<E: 'static> PointwiseFilter<E> {
             let mut active = [false; 3];
             for (ch, on) in active.iter_mut().enumerate() {
                 let a = input.channel(ch as i32, false)?;
-                for value in a.values() {
+                for &value in a.shared_values().iter() {
                     if value != 0.0 {
                         *on = true;
                         break;
@@ -1400,7 +1433,7 @@ impl<E: 'static> PointwiseFilter<E> {
             let (mut lo, mut hi) = (1.0, 0.0);
             for (ch, on) in active.iter().enumerate() {
                 if *on {
-                    for value in input.channel(ch as i32, false)?.values() {
+                    for &value in input.channel(ch as i32, false)?.shared_values().iter() {
                         if value < lo {
                             lo = value;
                         }
@@ -1429,9 +1462,14 @@ impl<E: 'static> PointwiseFilter<E> {
                     if on {
                         let source = input.channel(ch as i32, false)?;
                         let dest = normalized.destination(ch as i32, &source)?;
-                        for ix in 0..source.len() {
-                            dest.write(ix, mul(sub(source.read(ix)?, lo), scale))?;
-                        }
+                        let source = source.shared_values();
+                        dest.with_mut_slice(|pixels| {
+                            for (index, &value) in source.iter().enumerate() {
+                                *pixels.get_mut(index).ok_or(ImageError::Index)? =
+                                    mul(sub(value, lo), scale);
+                            }
+                            Ok::<_, ImageError>(())
+                        })?;
                     }
                 }
                 input = normalized;
@@ -1443,6 +1481,16 @@ impl<E: 'static> PointwiseFilter<E> {
         for ch in 0..3 {
             let source = input.channel(ch, false)?;
             let dest = out.destination(ch, &source)?;
+            if source.len() == dest.len() && !source.is_empty() {
+                let source = source.shared_values();
+                if let Some(first) = dest.with_mut_slice(|pixels| {
+                    adjust_bci_plane(&source, pixels, brightness, contrast, intensity)
+                }) {
+                    out.set_constant(ch, first)?;
+                }
+                continue;
+            }
+            // Preserve the source's checked behavior for malformed planes.
             if brightness != 0.0 {
                 ArithmeticWorker::new(
                     Op::AddScalar,

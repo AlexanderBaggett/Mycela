@@ -4,8 +4,8 @@ use crate::ImageError;
 
 /// Explicit source scheduler context. Regular z5 callers use WorkerPool with
 /// their actual processor count. CallingThread names the source aaa bypass.
-/// Gradient uses scoped workers for large images. Other numeric callers run
-/// these ranges sequentially.
+/// Dense kernels can use scoped workers for large images. The source chunk
+/// iterators below dispatch their ranges sequentially.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ProceduralExecution {
     CallingThread,
@@ -88,6 +88,38 @@ pub(crate) fn for_each_row_chunk<E>(
         worker(start, count)?;
     }
     Ok(())
+}
+
+/// Large dense passes can give workers nonoverlapping row bands. The
+/// supplied kernel owns the intra-row evaluation order and sees a local span.
+pub(crate) fn for_each_dense_band<T: Send>(
+    output: &mut [T],
+    width: usize,
+    execution: ProceduralExecution,
+    worker: impl Fn(usize, &mut [T]) -> Result<(), ImageError> + Sync,
+) -> Result<(), ImageError> {
+    let rows = output.len() / width;
+    let workers = match execution {
+        ProceduralExecution::WorkerPool { processor_count } if output.len() >= 512 * 512 => {
+            processor_count.clamp(1, 8) as usize
+        }
+        _ => 1,
+    };
+    if workers == 1 || rows < 2 {
+        return worker(0, output);
+    }
+    let rows_per_band = rows.div_ceil(workers);
+    std::thread::scope(|scope| {
+        let mut tasks = Vec::with_capacity(workers);
+        for (index, pixels) in output.chunks_mut(rows_per_band * width).enumerate() {
+            let worker = &worker;
+            tasks.push(scope.spawn(move || worker(index * rows_per_band, pixels)));
+        }
+        for task in tasks {
+            task.join().expect("dense render worker")?;
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]

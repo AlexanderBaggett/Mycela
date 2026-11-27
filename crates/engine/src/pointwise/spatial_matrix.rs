@@ -62,10 +62,9 @@ fn clone_buffer(source: &FloatBuffer) -> Result<FloatBuffer, ImageError> {
     // Source SafelyCloneArray: fresh allocation then copy BEFORE next worker.
     // Allocator emergency/retry/spill remains an explicit unported resource
     // capability; this never fakes a successful GC/provider callback.
-    let mut copy = singles(source.len())?;
-    for (index, value) in copy.iter_mut().enumerate() {
-        *value = source.read(index)?;
-    }
+    let values = source.shared_values();
+    let mut copy = singles(values.len())?;
+    copy.copy_from_slice(&values);
     Ok(FloatBuffer::new(copy))
 }
 /// Exact evaluated internal helper, including direct nonpositive iterations:
@@ -118,6 +117,7 @@ pub fn render_matrix<E>(
             taps += 1;
         }
     }
+    let mut dense_plan = None;
     let mut channel = 0i32;
     loop {
         // Dynamic input.ng is re-read after each processed/sealed channel.
@@ -136,9 +136,33 @@ pub fn render_matrix<E>(
             // Source constructs the worker even when iterations<=0, before
             // these field assignments. This pure leaf does not emulate its nz
             // native bootstrap/resources or fake their success with a provider.
+            let area = geometry
+                .width()
+                .checked_mul(geometry.height())
+                .filter(|area| *area > 0)
+                .map(|area| area as usize);
+            let dense = options.iterations > 0
+                && area == Some(source.len())
+                && area == Some(destination.len())
+                && !matches!(
+                    options.execution,
+                    ProceduralExecution::WorkerPool {
+                        processor_count: ..=0
+                    }
+                );
+            if dense && dense_plan.is_none() {
+                dense_plan =
+                    DenseMatrix::new(geometry, &weights[..taps], &xs[..taps], &ys[..taps])?;
+            }
             for iteration in 0..options.iterations {
                 if iteration > 0 {
                     source = clone_buffer(&destination)?;
+                }
+                if dense && let Some(plan) = &dense_plan {
+                    let source = source.shared_values();
+                    destination
+                        .with_mut_slice(|pixels| plan.run(&source, pixels, options.execution));
+                    continue;
                 }
                 for_each_row_chunk(geometry.height(), options.execution, |start, count| {
                     convolve(
@@ -198,6 +222,94 @@ fn coordinate(position: i32, offset: f64, extent: i32) -> i32 {
     }
     index
 }
+/// Cache wrapping coordinates for dense, ordinary rasters. A valid plane can
+/// be divided into disjoint row bands while retaining every tap's arithmetic.
+struct DenseMatrix<'a> {
+    width: usize,
+    weights: &'a [f32],
+    columns: Vec<[usize; 9]>,
+    rows: Vec<[usize; 9]>,
+}
+
+impl<'a> DenseMatrix<'a> {
+    fn new(
+        geometry: ImageGeometry,
+        weights: &'a [f32],
+        xs: &[f64],
+        ys: &[f64],
+    ) -> Result<Option<Self>, ImageError> {
+        let width = geometry.width();
+        let height = geometry.height();
+        if width <= 0 || height <= 0 {
+            return Ok(None);
+        }
+        let build = |extent: i32, stride: usize, offsets: &[f64]| {
+            let mut result = Vec::new();
+            result
+                .try_reserve_exact(extent as usize)
+                .map_err(|_| ImageError::Allocation)?;
+            for i in 0..extent {
+                let mut band = [0; 9];
+                for (entry, &offset) in band.iter_mut().zip(offsets) {
+                    let sample = coordinate(i, offset, extent);
+                    if !(0..extent).contains(&sample) {
+                        return Ok(None);
+                    }
+                    *entry = sample as usize * stride;
+                }
+                result.push(band);
+            }
+            Ok(Some(result))
+        };
+        let Some(columns) = build(width, 1, xs)? else {
+            return Ok(None);
+        };
+        let Some(rows) = build(height, width as usize, ys)? else {
+            return Ok(None);
+        };
+        Ok(Some(Self {
+            width: width as usize,
+            weights,
+            columns,
+            rows,
+        }))
+    }
+
+    fn run(&self, source: &[f32], output: &mut [f32], execution: ProceduralExecution) {
+        let weights = self.weights;
+        let render = |first_row, output: &mut [f32]| {
+            for (row, offsets) in output
+                .chunks_exact_mut(self.width)
+                .zip(&self.rows[first_row..])
+            {
+                for (pixel, columns) in row.iter_mut().zip(&self.columns) {
+                    let mut value = 0.;
+                    for (index, &weight) in weights.iter().enumerate() {
+                        value = add(value, mul(source[offsets[index] + columns[index]], weight));
+                    }
+                    *pixel = value;
+                }
+            }
+        };
+        let workers = match execution {
+            ProceduralExecution::WorkerPool { processor_count } if output.len() >= 512 * 512 => {
+                (processor_count as usize).min(8).min(self.rows.len())
+            }
+            _ => 1,
+        };
+        if workers <= 1 {
+            render(0, output);
+            return;
+        }
+        let rows_per_worker = self.rows.len().div_ceil(workers);
+        std::thread::scope(|scope| {
+            for (band, output) in output.chunks_mut(rows_per_worker * self.width).enumerate() {
+                scope.spawn(move || render(band * rows_per_worker, output));
+            }
+        });
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // Actual worker roots/count/geometry and bx interval.
 fn convolve<E>(
     source: Option<&FloatBuffer>,
