@@ -106,7 +106,7 @@ mod render;
 pub(crate) mod rotate_environment;
 mod shape;
 mod smear;
-pub use render::PointwiseRenderEffects;
+pub use render::{GraphProgressObserver, PointwiseRenderEffects};
 mod scene_image;
 mod shader;
 pub use shader::{DEFAULT_SHADER_SOURCE, ShaderInput, ShaderProgram};

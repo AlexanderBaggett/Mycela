@@ -120,6 +120,30 @@ impl ResultFrame {
     }
 }
 
+pub(super) enum ResultProgress {
+    Preparing,
+    Rendering { percent: u8, node: String },
+    Presenting,
+}
+
+impl ResultProgress {
+    pub(super) fn status(&self) -> String {
+        match self {
+            Self::Preparing => "Preparing render…".into(),
+            Self::Rendering { percent, node } => format!("Rendering {node} · {percent}%"),
+            Self::Presenting => "Preparing result · 99%".into(),
+        }
+    }
+
+    pub(super) fn percentage(&self) -> Option<f32> {
+        match self {
+            Self::Preparing => None,
+            Self::Rendering { percent, .. } => Some(f32::from(*percent)),
+            Self::Presenting => Some(99.),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 pub(super) enum RenderTarget {
     Texture,
@@ -325,6 +349,8 @@ impl GraphDocumentView {
         let ticket = Ticket::new();
         self.ticket = Some(ticket.clone());
         self.work = Some(Work::RenderingResult);
+        self.node_previews.suspend();
+        self.result_progress = Some(ResultProgress::Preparing);
         self.error = None;
         self.status = None;
         let background = cx.background_executor().clone();
@@ -332,24 +358,43 @@ impl GraphDocumentView {
         let request = request.clone();
         cx.spawn(async move |owner, cx| {
             let slot = request.slot;
-            let rendered = background
-                .spawn(async move {
-                    let job = pending.materialize().map_err(|error| error.to_string())?;
-                    let scene = job
-                        .render_scene(|| !task_ticket.is_current(), false)
-                        .map_err(|error| error.to_string())?;
-                    if !task_ticket.is_current() {
-                        return Ok(None);
+            let (send, receive) = async_channel::bounded(1);
+            let job = background.spawn(async move {
+                let job = pending.materialize().map_err(|error| error.to_string())?;
+                let scene = job
+                    .render_result_observed(|| !task_ticket.is_current(), &|done, node| {
+                        let progress = if done >= 1. {
+                            ResultProgress::Presenting
+                        } else {
+                            ResultProgress::Rendering {
+                                percent: (done * 99.).floor() as u8,
+                                node: node.to_owned(),
+                            }
+                        };
+                        let _ = send.force_send(progress);
+                    })
+                    .map_err(|error| error.to_string())?;
+                if !task_ticket.is_current() {
+                    return Ok(None);
+                }
+                ResultFrame::prepare(scene, request.source, request.time).map(Some)
+            });
+            while let Ok(progress) = receive.recv().await {
+                let _ = owner.update(cx, |view, cx| {
+                    if view.owns(&ticket) {
+                        view.result_progress = Some(progress);
+                        cx.notify();
                     }
-                    ResultFrame::prepare(scene, request.source, request.time).map(Some)
-                })
-                .await;
+                });
+            }
+            let rendered = job.await;
             let _ = owner.update(cx, |view, cx| {
                 if !view.owns(&ticket) {
                     return;
                 }
                 view.ticket = None;
                 view.work = None;
+                view.result_progress = None;
                 ticket.retire();
                 match rendered {
                     Ok(Some(frame)) => {
@@ -375,6 +420,7 @@ impl GraphDocumentView {
             ticket.retire();
         }
         self.work = None;
+        self.result_progress = None;
         self.status = Some("Render cancelled.".into());
         cx.notify();
     }
@@ -609,15 +655,6 @@ impl GraphDocumentView {
                             }
                             cx.notify();
                         })),
-                )
-            })
-            .when(self.work == Some(Work::RenderingResult), |row| {
-                row.child(
-                    Button::new("graph-cancel-result")
-                        .small()
-                        .tab_index(0)
-                        .label("Cancel render")
-                        .on_click(cx.listener(|view, _, _, cx| view.cancel_result_render(cx))),
                 )
             })
     }

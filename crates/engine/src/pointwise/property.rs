@@ -103,6 +103,7 @@ pub enum PointwiseKind {
     Style,
     Synthesis,
     Checkerboard,
+    ChangeOklab,
 }
 impl PointwiseKind {
     pub(super) fn has_compact_inputs(self) -> bool {
@@ -166,6 +167,7 @@ impl PointwiseKind {
             Self::WizardReference => "Wizard Reference",
             Self::ChangeBci => "Change BCI",
             Self::ChangeHsb => "Change HSB",
+            Self::ChangeOklab => "Change Oklab",
             Self::Colorize => "Colorize",
             Self::ColorizeG2 => "Colorize G2",
             Self::Levels => "Levels",
@@ -900,43 +902,53 @@ fn choice<E>(name: &str, options: &[&str], current: i32) -> ParameterState<E> {
         },
     }
 }
-fn oklab_parameters<E>() -> Result<Vec<ParameterState<E>>, ImageError> {
+fn oklab_parameters<E>(adjustment: bool) -> Result<Vec<ParameterState<E>>, ImageError> {
     let chroma = DecimalBits::new([4, 0, 0, 1 << 16]).map_err(|_| ImageError::Argument)?;
     let negative_chroma =
         DecimalBits::new([4, 0, 0, 0x8001_0000]).map_err(|_| ImageError::Argument)?;
     let unit = [decimal(0)?, decimal(1)?];
     let signed = [negative_chroma, chroma];
     let step = DecimalBits::new([1, 0, 0, 4 << 16]).map_err(|_| ImageError::Argument)?;
-    [
-        ("Lightness", 0.5, unit),
-        ("a (green–red)", 0.0, signed),
-        ("b (blue–yellow)", 0.0, signed),
-        ("Opacity", 1.0, unit),
-    ]
-    .into_iter()
-    .map(|(name, initial, [minimum, maximum])| {
-        let limits = SharedLimits::from_definition(LimitsDefinition {
-            decimal_places: 4,
-            step: LimitsStep::Derived(step),
-            minimum,
-            maximum,
-            used: true,
-            use_range: None,
-            curve_range: None,
+    let fields: &[(&str, f64, [DecimalBits; 2])] = if adjustment {
+        &[
+            ("Lightness", 0.0, [decimal(-1)?, decimal(1)?]),
+            ("a (green–red)", 0.0, signed),
+            ("b (blue–yellow)", 0.0, signed),
+        ]
+    } else {
+        &[
+            ("Lightness", 0.5, unit),
+            ("a (green–red)", 0.0, signed),
+            ("b (blue–yellow)", 0.0, signed),
+            ("Opacity", 1.0, unit),
+        ]
+    };
+    fields
+        .iter()
+        .copied()
+        .map(|(name, initial, [minimum, maximum])| {
+            let limits = SharedLimits::from_definition(LimitsDefinition {
+                decimal_places: 4,
+                step: LimitsStep::Derived(step),
+                minimum,
+                maximum,
+                used: true,
+                use_range: None,
+                curve_range: None,
+            })
+            .map_err(|_| ImageError::Overflow)?;
+            Ok(ParameterState {
+                extras: ParameterExtras::default(),
+                choice_memory: None,
+                name: text(name),
+                value: PointwiseParameterValue::Number {
+                    current: initial,
+                    previous: initial,
+                    limits,
+                },
+            })
         })
-        .map_err(|_| ImageError::Overflow)?;
-        Ok(ParameterState {
-            extras: ParameterExtras::default(),
-            choice_memory: None,
-            name: text(name),
-            value: PointwiseParameterValue::Number {
-                current: initial,
-                previous: initial,
-                limits,
-            },
-        })
-    })
-    .collect()
+        .collect()
 }
 fn blur_number<E>(
     name: &str,
@@ -1451,7 +1463,8 @@ impl<E> PointwiseFilter<E> {
             PointwiseKind::Shadow => point_light::shadow_parameters()?,
             PointwiseKind::ShadowG2 => point_light::shadow_g2_parameters()?,
             PointwiseKind::Polygon => transform_parameters::polygon_parameters(mode)?,
-            PointwiseKind::OklabColor => oklab_parameters()?,
+            PointwiseKind::OklabColor => oklab_parameters(false)?,
+            PointwiseKind::ChangeOklab => oklab_parameters(true)?,
             PointwiseKind::Checkerboard => checkerboard_parameters()?,
             PointwiseKind::Shader => Vec::new(),
             PointwiseKind::LegacyBricksBoards => transform_parameters::parameters(kind, mode)?,

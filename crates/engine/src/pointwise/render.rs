@@ -6,6 +6,9 @@ use super::{
 };
 use crate::{EnvironmentResourceLibrary, FloatBuffer, ImageError, ImageGeometry, SharedGradient};
 
+/// Receives estimated render completion and the active graph node label.
+pub type GraphProgressObserver<'a> = &'a dyn Fn(f32, &str);
+
 /// Borrowed actual source memory effects. Never retained in model/capture data.
 /// Combine asks a Boolean quality4 predicate; blur/Noise require the separate
 /// void preflight (blur quality2). Caller releases policy locks before return.
@@ -15,6 +18,7 @@ pub struct PointwiseRenderEffects<'a, E> {
     scene_renderer: Option<&'a mut dyn super::SceneImageRenderer<E>>,
     cancelled: &'a dyn Fn() -> bool,
     environment_library: Option<&'a EnvironmentResourceLibrary>,
+    graph_progress: Option<GraphProgressObserver<'a>>,
 }
 impl<'a, E> PointwiseRenderEffects<'a, E> {
     pub fn new(
@@ -27,6 +31,7 @@ impl<'a, E> PointwiseRenderEffects<'a, E> {
             scene_renderer: None,
             cancelled: &|| false,
             environment_library: None,
+            graph_progress: None,
         }
     }
     /// Borrow the active job's cancellation check for this graph evaluation.
@@ -34,6 +39,17 @@ impl<'a, E> PointwiseRenderEffects<'a, E> {
         self.cancelled = cancelled;
         self
     }
+    /// Observe estimated graph-work completion (0 to 1) and the active
+    /// node label. The largest kernels may span several seconds per update.
+    pub fn with_graph_progress(mut self, progress: Option<GraphProgressObserver<'a>>) -> Self {
+        self.graph_progress = progress;
+        self
+    }
+
+    pub(super) fn graph_progress(&self) -> Option<GraphProgressObserver<'a>> {
+        self.graph_progress
+    }
+
     pub fn with_environment_library(
         mut self,
         library: Option<&'a EnvironmentResourceLibrary>,
@@ -1350,6 +1366,14 @@ impl<E: 'static> PointwiseFilter<E> {
                 Ok(Some(out))
             }
             PointwiseKind::ChangeBci => self.render_bci(get(inputs, 0)?, width, height, None),
+            PointwiseKind::ChangeOklab => super::oklab::adjust(
+                self,
+                get(inputs, 0)?,
+                ImageGeometry::new(width, height),
+                None,
+                &|| false,
+            )
+            .map(Some),
             PointwiseKind::ChangeHsb => self
                 .render_hsb(get(inputs, 0)?, width, height, None)
                 .map(Some),
@@ -1906,6 +1930,16 @@ impl<E: 'static> PointwiseFilter<E> {
                 effects.cancel_check(),
             );
         }
+        if self.kind() == PointwiseKind::ChangeOklab {
+            return super::oklab::adjust(
+                self,
+                get(inputs, 0)?,
+                ImageGeometry::new(width, height),
+                Some(time),
+                effects.cancel_check(),
+            )
+            .map(Some);
+        }
         if self.kind() == PointwiseKind::OklabColor {
             return super::oklab::render(
                 self,
@@ -2253,6 +2287,16 @@ impl<E: 'static> PointwiseFilter<E> {
                 time,
                 &|| false,
             );
+        }
+        if self.kind() == PointwiseKind::ChangeOklab {
+            return super::oklab::adjust(
+                self,
+                get(inputs, 0)?,
+                ImageGeometry::new(width, height),
+                Some(time),
+                &|| false,
+            )
+            .map(Some);
         }
         if self.kind() == PointwiseKind::OklabColor {
             return super::oklab::render(

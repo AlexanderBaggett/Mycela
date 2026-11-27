@@ -104,6 +104,9 @@ fn create_with_context<E: 'static>(
     if equals(identity, PointwiseKind::Shader.name()) {
         return Ok(PointwiseFilter::new(PointwiseKind::Shader)?.node());
     }
+    if equals(identity, PointwiseKind::ChangeOklab.name()) {
+        return Ok(PointwiseFilter::new(PointwiseKind::ChangeOklab)?.node());
+    }
     if equals(identity, PointwiseKind::OklabColor.name()) {
         // Mycela extension. This identity is outside the original registry.
         return Ok(PointwiseFilter::new(PointwiseKind::OklabColor)?.node());

@@ -219,12 +219,20 @@ impl ExportRenderJob {
         cancelled: impl Fn() -> bool,
         preview_fallback: bool,
     ) -> Result<RenderedScene, ExportRenderError> {
-        self.render_scene_with_inputs(cancelled, preview_fallback, &mut Vec::new())
+        self.render_scene_with_inputs(cancelled, preview_fallback, &mut Vec::new(), None)
+    }
+
+    pub(crate) fn render_result_observed(
+        self,
+        cancelled: impl Fn() -> bool,
+        progress: mycela_engine::GraphProgressObserver<'_>,
+    ) -> Result<RenderedScene, ExportRenderError> {
+        self.render_scene_with_inputs(cancelled, false, &mut Vec::new(), Some(progress))
     }
     // Reached options remain usable even if a later stage or projection fails.
     pub(crate) fn render_preview_scene(self, cancelled: impl Fn() -> bool) -> PreviewSceneResult {
         let mut inputs = Vec::new();
-        let result = self.render_scene_with_inputs(cancelled, true, &mut inputs);
+        let result = self.render_scene_with_inputs(cancelled, true, &mut inputs, None);
         PreviewSceneResult {
             result,
             layer_inputs: inputs,
@@ -235,6 +243,7 @@ impl ExportRenderJob {
         cancelled: impl Fn() -> bool,
         preview_fallback: bool,
         layer_inputs: &mut Vec<(u64, mycela_engine::SharedImageMap)>,
+        progress: Option<mycela_engine::GraphProgressObserver<'_>>,
     ) -> Result<RenderedScene, ExportRenderError> {
         checkpoint(&cancelled)?;
         let image = match self.source {
@@ -246,7 +255,7 @@ impl ExportRenderJob {
             SourceFrame::Graph(snapshot, camera) => {
                 let options = crate::scene_backend::GRAPH_PNG_OPTIONS;
                 if !preview_fallback {
-                    crate::scene_backend::render_export(
+                    crate::scene_backend::render_export_observed(
                         &snapshot,
                         mycela_engine::ImageGeometry::new(
                             self.geometry.width(),
@@ -257,6 +266,7 @@ impl ExportRenderJob {
                         camera.as_ref(),
                         self.graph_cache.as_ref(),
                         self.environment_library.as_ref(),
+                        progress,
                     )?
                 } else {
                     match camera {
@@ -312,6 +322,9 @@ impl ExportRenderJob {
         } else {
             self.selection
         };
+        if let Some(progress) = progress {
+            progress(1., "");
+        }
         let bitmap = project_bitmap(&image, &selection).map_err(ExportRenderError::Render)?;
         checkpoint(&cancelled)?;
         Ok(RenderedScene {

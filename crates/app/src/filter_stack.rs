@@ -34,9 +34,10 @@ const MAX_FILTERS: usize = 32;
 pub(crate) const REGION_MODES: [&str; 4] =
     ["4 squares", "8 triangles", "24 triangles", "48 triangles"];
 pub(crate) const OKLAB_INPUT_HELP: &str = "Connected maps use their red channel in place of the value or curve. For a and b, black is −0.4, mid-gray is 0, and white is +0.4.";
-const KINDS: [PointwiseKind; 57] = [
+const KINDS: [PointwiseKind; 58] = [
     PointwiseKind::ChangeBci,
     PointwiseKind::ChangeHsb,
+    PointwiseKind::ChangeOklab,
     PointwiseKind::Colorize,
     PointwiseKind::OklabColor,
     PointwiseKind::Levels,
@@ -117,6 +118,7 @@ fn catalog_group(kind: PointwiseKind) -> &'static str {
         PointwiseKind::Style | PointwiseKind::Synthesis => "Advanced",
         PointwiseKind::ChangeBci
         | PointwiseKind::ChangeHsb
+        | PointwiseKind::ChangeOklab
         | PointwiseKind::Colorize
         | PointwiseKind::ColorizeG2
         | PointwiseKind::OklabColor

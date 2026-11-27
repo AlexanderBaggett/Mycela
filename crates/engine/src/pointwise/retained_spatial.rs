@@ -337,6 +337,7 @@ impl<E> PointwiseFilter<E> {
             }
             PointwiseKind::ChangeBci
             | PointwiseKind::ChangeHsb
+            | PointwiseKind::ChangeOklab
             | PointwiseKind::Colorize
             | PointwiseKind::ColorizeG2
             | PointwiseKind::Levels

@@ -131,6 +131,7 @@ impl GraphDocumentView {
                                 | mycela_engine::PointwiseKind::Distort
                                 | mycela_engine::PointwiseKind::ChangeBci
                                 | mycela_engine::PointwiseKind::ChangeHsb
+                                | mycela_engine::PointwiseKind::ChangeOklab
                                 | mycela_engine::PointwiseKind::Checkerboard
                                 | mycela_engine::PointwiseKind::Exposure
                                 | mycela_engine::PointwiseKind::Selector

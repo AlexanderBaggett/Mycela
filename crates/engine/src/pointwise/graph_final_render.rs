@@ -19,6 +19,12 @@ mod thumbnail_cache;
 pub use thumbnail_cache::PointwiseThumbnailCache;
 pub(in crate::pointwise) use thumbnail_cache::ThumbnailReuse;
 
+#[path = "graph_sequence_cache.rs"]
+mod sequence_cache;
+pub(super) use sequence_cache::OriginalSequenceFrame;
+use sequence_cache::SequenceFrameImages;
+pub(in crate::pointwise) use sequence_cache::SequenceOutputCache;
+
 /// The private final-render copies of a graph and its enclosing groups.
 /// Each original accepts cache writes from the latest eligible copy by identity.
 pub struct PointwiseFinalGraph<E = ()> {
@@ -126,6 +132,7 @@ impl<E: 'static> PointwiseNode<E> {
                                 | PointwiseKind::Synthesis
                                 | PointwiseKind::ChangeBci
                                 | PointwiseKind::ChangeHsb
+                                | PointwiseKind::ChangeOklab
                                 | PointwiseKind::Colorize
                                 | PointwiseKind::ColorizeG2
                                 | PointwiseKind::LegacyBricksBoards
@@ -464,6 +471,8 @@ impl<E: 'static> PointwiseFinalGraph<E> {
             images: BTreeMap::new(),
             scenes: BTreeMap::new(),
             prepared_groups: BTreeMap::new(),
+            sequence_frame: matches!(reuse, FinalImageReuse::Sequence(_))
+                .then(SequenceFrameImages::new),
             reuse,
         };
         self.selected
@@ -474,6 +483,7 @@ impl<E: 'static> PointwiseFinalGraph<E> {
                 Some((time, execution)),
                 effects,
                 Some(&mut state),
+                None,
             )
             .map_err(final_render_error)
     }
@@ -908,12 +918,14 @@ pub(super) struct FinalGraphExecution<'a, E> {
     scenes: BTreeMap<NodeId, Option<Scene>>,
     prepared_groups: BTreeMap<NodeId, Vec<FinalSlotDemand>>,
     reuse: FinalImageReuse<'a>,
+    sequence_frame: Option<SequenceFrameImages>,
 }
 
 pub(in crate::pointwise) enum FinalImageReuse<'a> {
     None,
     Original,
     Playback(&'a mut PlaybackImageCache),
+    Sequence(&'a mut SequenceOutputCache),
     Thumbnail(ThumbnailReuse<'a>),
 }
 
@@ -1051,6 +1063,12 @@ impl<E: 'static> FinalGraphExecution<'_, E> {
                 .get(&node.id)
                 .filter(|image| image.geometry() == geometry)
                 .map(SharedImageMap::share_pixel_backing),
+            FinalImageReuse::Sequence(cache) => cache.image(
+                node.id,
+                geometry,
+                &mut self.images,
+                self.sequence_frame.as_mut().expect("sequence frame state"),
+            ),
             FinalImageReuse::Thumbnail(reuse) => reuse.lookup(node.id, self.originals[&node.id].id),
         }?;
         self.images.insert(node.id, image.clone());
@@ -1067,6 +1085,11 @@ impl<E: 'static> FinalGraphExecution<'_, E> {
                 drop(old);
             }
             FinalImageReuse::Playback(cache) => cache.record(node, image, &self.images),
+            FinalImageReuse::Sequence(cache) => cache.record_image(
+                node,
+                image,
+                self.sequence_frame.as_mut().expect("sequence frame state"),
+            ),
             FinalImageReuse::Thumbnail(reuse) => {
                 reuse.record(node, self.originals[&node.id].id, image)
             }
@@ -1074,11 +1097,20 @@ impl<E: 'static> FinalGraphExecution<'_, E> {
     }
 
     pub(super) fn record_scene(&mut self, node: &PointwiseNode<E>, scene: Option<Scene>) {
+        if let FinalImageReuse::Sequence(cache) = &mut self.reuse {
+            cache.record_scene(node, &scene);
+        }
         self.scenes.insert(node.id, scene);
     }
 
     pub(super) fn scene(&self, node: &PointwiseNode<E>) -> Option<Option<Scene>> {
-        self.scenes.get(&node.id).cloned()
+        self.scenes
+            .get(&node.id)
+            .cloned()
+            .or_else(|| match &self.reuse {
+                FinalImageReuse::Sequence(cache) => cache.scene(node.id),
+                _ => None,
+            })
     }
 
     pub(super) fn group_inputs_prepared(
@@ -1499,6 +1531,122 @@ mod tests {
         animate(noise.parameter(Location).animation().unwrap(), 0.0, 0.5);
         let (animated_noise, still, _) = run();
         assert_eq!(animated_noise, still);
+    }
+
+    #[test]
+    fn sequence_reuses_a_stationary_filter_inside_a_group_and_tracks_animated_inputs() {
+        use crate::{AnalyticCurveKind, CurveLayerHandle, GradientAnimation};
+
+        let checkerboard = PointwiseFilter::<()>::new(PointwiseKind::Checkerboard).unwrap();
+        let group = PointwiseFilter::new(PointwiseKind::Group).unwrap().node();
+        group
+            .slot(0)
+            .unwrap()
+            .set_node(Some(&checkerboard.node()))
+            .unwrap();
+        let reference = PointwiseFilter::new(PointwiseKind::Reference)
+            .unwrap()
+            .node();
+        let blur = PointwiseFilter::new(PointwiseKind::GaussianBlur).unwrap();
+        blur.parameter(1).unwrap().set_number(0.1).unwrap();
+        blur.node()
+            .slot(0)
+            .unwrap()
+            .set_node(Some(&reference))
+            .unwrap();
+        let invert = PointwiseNode::invert();
+        invert
+            .slot(0)
+            .unwrap()
+            .set_node(Some(&blur.node()))
+            .unwrap();
+        invert.set_invert_red_only().unwrap();
+        group.content(0).unwrap().set_node(Some(&invert)).unwrap();
+
+        let animate = |animation: GradientAnimation<()>, min, max| {
+            animation.ensure_curve(0).unwrap();
+            let curve = animation.curves().unwrap().value(0).unwrap().unwrap();
+            curve.set_minimum(min);
+            curve.set_maximum(max);
+            curve.append(&[Some(CurveLayerHandle::new(AnalyticCurveKind::Linear))]);
+            animation.flags().unwrap().set(0, true).unwrap();
+        };
+        animate(
+            invert
+                .invert_property(0)
+                .unwrap()
+                .animation()
+                .unwrap()
+                .unwrap(),
+            1.,
+            2.,
+        );
+
+        let geometry = ImageGeometry::new(40, 26);
+        let options = PointwiseRenderOptions::new(false, true);
+        let times = [0.125, 0.5, 0.875];
+        let run = || {
+            let mut sequence = RenderCaptureSession::new()
+                .capture_node(&group, 0.)
+                .unwrap()
+                .prepare_sequence(geometry, options)
+                .unwrap();
+            let still = group.final_graph_clone().unwrap();
+            let mut sequence_preflights = 0;
+            let mut still_preflights = 0;
+            let mut first_pixels = Vec::new();
+            for time in times {
+                let image = sequence
+                    .render_frame(
+                        time,
+                        CallingThread,
+                        &mut PointwiseRenderEffects::new(&mut |_| unreachable!(), &mut |_, _| {
+                            sequence_preflights += 1;
+                            Ok(())
+                        }),
+                    )
+                    .unwrap()
+                    .image()
+                    .unwrap();
+                let expected = still
+                    .render_with_effects(
+                        geometry,
+                        time,
+                        CallingThread,
+                        options,
+                        false,
+                        &mut PointwiseRenderEffects::new(&mut |_| unreachable!(), &mut |_, _| {
+                            still_preflights += 1;
+                            Ok(())
+                        }),
+                    )
+                    .unwrap()
+                    .image()
+                    .unwrap();
+                first_pixels.push(first_pixel(&image));
+                for ch in 0..4 {
+                    assert_eq!(
+                        image.channel(ch, true).unwrap().values(),
+                        expected.channel(ch, true).unwrap().values(),
+                        "time {time}, channel {ch}"
+                    );
+                }
+            }
+            assert_ne!(first_pixels[0], first_pixels[2]);
+            (sequence_preflights, still_preflights)
+        };
+
+        let (cached, uncached) = run();
+        assert!(cached > 0);
+        assert_eq!(uncached, cached * times.len());
+
+        animate(
+            checkerboard.parameter(4).unwrap().animation().unwrap(),
+            2.,
+            5.,
+        );
+        let (animated, uncached) = run();
+        assert_eq!(animated, uncached);
     }
 
     #[test]

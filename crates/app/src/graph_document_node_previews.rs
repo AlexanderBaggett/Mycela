@@ -524,6 +524,9 @@ impl GraphDocumentView {
         mut nodes: Vec<Node>,
         cx: &mut Context<Self>,
     ) {
+        if self.work == Some(super::Work::RenderingResult) {
+            return;
+        }
         let mut ids = HashSet::new();
         nodes.retain(|node| ids.insert(node.occurrence_id()));
         let scope = Scope {

@@ -678,6 +678,7 @@ impl<E: 'static> PointwiseNode<E> {
             kind,
             Some(
                 PointwiseKind::OklabColor
+                    | PointwiseKind::ChangeOklab
                     | PointwiseKind::MedianBlur
                     | PointwiseKind::Shader
                     | PointwiseKind::Checkerboard

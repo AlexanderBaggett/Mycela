@@ -124,7 +124,8 @@ impl ShaderProgram {
         let time_dependent = module.functions.iter().any(|(_, function)| {
             function.expressions.iter().any(|(_, expression)| {
                 matches!(expression, naga::Expression::GlobalVariable(handle)
-                    if module.global_variables[*handle].name.as_deref() == Some("time"))
+                    if matches!(module.global_variables[*handle].name.as_deref(),
+                        Some("time" | "mycela_uniforms")))
             })
         });
         let mut inputs = Vec::new();
@@ -266,6 +267,20 @@ fn tokens(source: &str) -> Vec<Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn animation_detects_direct_use_of_the_time_uniform() {
+        let shader = ShaderProgram::compile(
+            "fn shade(uv: vec2f) -> vec4f { return vec4f(uv, mycela_uniforms.time, 1.0); }",
+        )
+        .unwrap();
+        assert!(shader.is_time_dependent());
+        assert!(
+            !ShaderProgram::compile(DEFAULT_SHADER_SOURCE)
+                .unwrap()
+                .is_time_dependent()
+        );
+    }
 
     #[test]
     fn shader_reflects_ports_and_requires_swizzle_opt_in() {

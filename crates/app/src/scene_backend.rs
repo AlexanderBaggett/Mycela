@@ -346,7 +346,7 @@ pub(crate) fn render_thumbnail_sample(
     cancelled: &impl Fn() -> bool,
     library: &mycela_engine::EnvironmentResourceLibrary,
 ) -> Result<RenderedImage, RenderError> {
-    evaluate_with_devices(devices, cancelled, None, Some(library), |effects| {
+    evaluate_with_devices(devices, cancelled, None, Some(library), None, |effects| {
         renderer.render_sample(
             time,
             animated,
@@ -366,7 +366,7 @@ pub(crate) fn render_sequence_frame(
     library: &mycela_engine::EnvironmentResourceLibrary,
 ) -> Result<SharedImageMap, RenderError> {
     let execution = crate::export_render::generator_execution();
-    let image = evaluate_with_devices(devices, cancelled, None, Some(library), |effects| {
+    let image = evaluate_with_devices(devices, cancelled, None, Some(library), None, |effects| {
         renderer.render_frame(time, execution, effects)
     })?
     .still_image()
@@ -388,14 +388,37 @@ pub(crate) fn render_export(
     cache: Option<&PointwiseFinalExportCache<ForegroundError>>,
     library: Option<&mycela_engine::EnvironmentResourceLibrary>,
 ) -> Result<SharedImageMap, RenderError> {
-    evaluate(cancelled, camera, library, |effects| {
-        let execution = crate::export_render::generator_execution();
-        if let (Some(cache), None) = (cache, camera) {
-            cache.render_snapshot_with_effects(snapshot, geometry, execution, options, effects)
-        } else {
-            snapshot.render_export_with_effects(geometry, execution, options, effects)
-        }
-    })?
+    render_export_observed(
+        snapshot, geometry, cancelled, options, camera, cache, library, None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_export_observed(
+    snapshot: &PointwiseNodeRenderSnapshot<ForegroundError>,
+    geometry: mycela_engine::ImageGeometry,
+    cancelled: &impl Fn() -> bool,
+    options: PointwiseRenderOptions,
+    camera: Option<&CameraFrame>,
+    cache: Option<&PointwiseFinalExportCache<ForegroundError>>,
+    library: Option<&mycela_engine::EnvironmentResourceLibrary>,
+    progress: Option<mycela_engine::GraphProgressObserver<'_>>,
+) -> Result<SharedImageMap, RenderError> {
+    evaluate_with_devices(
+        &mut PreviewDevices::default(),
+        cancelled,
+        camera,
+        library,
+        progress,
+        |effects| {
+            let execution = crate::export_render::generator_execution();
+            if let (Some(cache), None) = (cache, camera) {
+                cache.render_snapshot_with_effects(snapshot, geometry, execution, options, effects)
+            } else {
+                snapshot.render_export_with_effects(geometry, execution, options, effects)
+            }
+        },
+    )?
     .still_image()
     .ok_or_else(|| failure("The graph returned no still image."))
 }
@@ -493,6 +516,7 @@ fn evaluate(
         cancelled,
         camera,
         library,
+        None,
         execute,
     )
 }
@@ -502,6 +526,7 @@ fn evaluate_with_devices(
     cancelled: &impl Fn() -> bool,
     camera: Option<&CameraFrame>,
     library: Option<&mycela_engine::EnvironmentResourceLibrary>,
+    progress: Option<mycela_engine::GraphProgressObserver<'_>>,
     execute: impl FnOnce(
         &mut PointwiseRenderEffects<'_, ForegroundError>,
     ) -> Result<
@@ -529,7 +554,8 @@ fn evaluate_with_devices(
         let mut effects = PointwiseRenderEffects::new(&mut capacity, &mut preflight)
             .with_cancel_check(cancelled)
             .with_scene_renderer(&mut backend)
-            .with_environment_library(library);
+            .with_environment_library(library)
+            .with_graph_progress(progress);
         execute(&mut effects)
     };
     if let Some(error) = backend.failure {

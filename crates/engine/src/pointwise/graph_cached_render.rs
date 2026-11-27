@@ -818,6 +818,13 @@ impl<E: 'static> PointwiseNode<E> {
     pub(in crate::pointwise) fn local_animated_preview_needed(
         &self,
     ) -> Result<bool, PointwiseError<E>> {
+        self.local_animation_needed(true)
+    }
+
+    pub(in crate::pointwise) fn local_animation_needed(
+        &self,
+        skip_overridden_controls: bool,
+    ) -> Result<bool, PointwiseError<E>> {
         if self
             .shader_program()
             .is_some_and(|shader| shader.is_time_dependent())
@@ -849,7 +856,8 @@ impl<E: 'static> PointwiseNode<E> {
         }
         if let Some(filter) = self.filter() {
             for (index, property) in filter.parameters().into_iter().enumerate() {
-                if filter.kind() == PointwiseKind::OklabColor
+                if skip_overridden_controls
+                    && filter.kind() == PointwiseKind::OklabColor
                     && self.slot(index as i32)?.node().is_some()
                 {
                     continue;

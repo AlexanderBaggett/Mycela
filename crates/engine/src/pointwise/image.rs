@@ -33,6 +33,9 @@ impl SharedImageMap {
     pub fn from_image(image: ImageMap) -> Self {
         Self(Arc::new(Mutex::new(image)))
     }
+    pub(super) fn storage_identity(&self) -> usize {
+        Arc::as_ptr(&self.0) as usize
+    }
     pub fn same_reference(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }

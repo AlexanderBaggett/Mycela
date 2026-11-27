@@ -355,6 +355,7 @@ pub struct GraphDocumentView {
     error: Option<String>,
     status: Option<String>,
     sequence_progress: Option<sequence::SequenceProgress>,
+    result_progress: Option<results::ResultProgress>,
     selection_serial: u64,
     inspector_scroll: gpui_kit::ScrollHandle,
     synthesis_source_anchor: gpui_kit::ScrollAnchor,
@@ -600,6 +601,7 @@ impl GraphDocumentView {
             error: None,
             status: None,
             sequence_progress: None,
+            result_progress: None,
             selection_serial: 0,
             inspector_scroll,
             synthesis_source_anchor,
@@ -713,6 +715,7 @@ impl GraphDocumentView {
         self.node_previews.clear();
         self.results = results::Results::default();
         self.sequence_progress = None;
+        self.result_progress = None;
     }
     fn restore_tree_selection(&self, cx: &mut Context<Self>) {
         let selected = self.selection.clone();
@@ -3476,6 +3479,7 @@ const NODES_WITH_INPUTS: &[&str] = &[
     "Invert",
     "Change BCI",
     "Change HSB",
+    "Change Oklab",
     "Colorize",
     "Levels",
     "Get Channel",
@@ -4945,6 +4949,15 @@ impl Render for GraphDocumentView {
                     | Work::WritingSynthesisPreset
             )
         ) || self.work == Some(Work::Exporting) && !results_visible;
+        let progress = self
+            .sequence_progress
+            .as_ref()
+            .map(|progress| progress.percentage())
+            .or_else(|| {
+                self.result_progress
+                    .as_ref()
+                    .and_then(|progress| progress.percentage())
+            });
         let feedback = self
             .error
             .clone()
@@ -4971,7 +4984,10 @@ impl Render for GraphDocumentView {
                 Some(Work::ChoosingExport) => "Choose where to save the image".into(),
                 Some(Work::Exporting) if results_visible => "Saving image…".into(),
                 Some(Work::Exporting) => "Rendering and saving image…".into(),
-                Some(Work::RenderingResult) => "Rendering result…".into(),
+                Some(Work::RenderingResult) => self
+                    .result_progress
+                    .as_ref()
+                    .map_or_else(|| "Preparing render…".into(), |progress| progress.status()),
                 Some(Work::ChoosingSequence) => "Choose an output folder and sequence name".into(),
                 Some(Work::ChoosingVideo) => "Choose where to save the video".into(),
                 Some(Work::RenderingSequence) => self.sequence_progress.as_ref().map_or_else(
@@ -5114,23 +5130,34 @@ impl Render for GraphDocumentView {
                     .border_color(theme.border)
                     .text_sm()
                     .when(self.error.is_some(), |this| this.text_color(theme.danger))
-                    .child(feedback)
+                    .child(
+                        div()
+                            .child(feedback)
+                            .when(rendering, |label| label.min_w_0().flex_1().truncate()),
+                    )
                     .when(rendering, |row| {
                         row.child(
                             div()
                                 .id("graph-render-progress")
                                 .test_support()
                                 .w(rems(9.))
+                                .flex_shrink_0()
                                 .child(
                                     Progress::new("render-progress")
                                         .small()
-                                        .loading(self.sequence_progress.is_none())
-                                        .value(
-                                            self.sequence_progress
-                                                .as_ref()
-                                                .map_or(0., |p| p.percentage()),
-                                        )
+                                        .loading(progress.is_none())
+                                        .value(progress.unwrap_or_default())
                                         .accessibility_label("Render progress"),
+                                ),
+                        )
+                    })
+                    .when(self.work == Some(Work::RenderingResult), |row| {
+                        row.child(
+                            Button::new("graph-cancel-result")
+                                .small()
+                                .label("Cancel render")
+                                .on_click(
+                                    cx.listener(|view, _, _, cx| view.cancel_result_render(cx)),
                                 ),
                         )
                     })

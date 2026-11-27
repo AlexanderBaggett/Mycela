@@ -1481,13 +1481,13 @@ impl<E: 'static> PointwiseThumbnailRender<E> {
 }
 
 /// A frozen final graph streamed at caller-selected animation times. Static
-/// raster results use the same bounded cache as final-quality playback.
+/// outputs and their dependencies are reused for the life of the export.
 pub struct PointwiseSequenceRender<E = ()> {
     snapshot: PointwiseNodeRenderSnapshot<E>,
     graph: Option<crate::PointwiseFinalGraph<E>>,
     geometry: crate::ImageGeometry,
     options: PointwiseRenderOptions,
-    cache: super::super::graph::PlaybackImageCache,
+    cache: super::super::graph::SequenceOutputCache,
 }
 
 impl<E: 'static> PointwiseSequenceRender<E> {
@@ -1505,15 +1505,15 @@ impl<E: 'static> PointwiseSequenceRender<E> {
                 time,
                 execution,
                 self.options,
-                FinalImageReuse::Playback(&mut self.cache),
+                FinalImageReuse::Sequence(&mut self.cache),
                 effects,
             ),
-            None => self.snapshot.render_export_frame(
-                None,
+            None => self.snapshot.node.render_original_sequence_frame(
                 self.geometry,
                 time,
                 execution,
                 self.options,
+                &mut self.cache,
                 effects,
             ),
         }
@@ -1532,7 +1532,7 @@ impl<E: 'static> PointwiseNodeRenderSnapshot<E> {
             graph,
             geometry,
             options,
-            cache: super::super::graph::PlaybackImageCache::new(),
+            cache: super::super::graph::SequenceOutputCache::default(),
         })
     }
 

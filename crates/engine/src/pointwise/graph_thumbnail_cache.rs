@@ -185,6 +185,7 @@ impl<'a> ThumbnailReuse<'a> {
                 PointwiseKind::Checkerboard
                     | PointwiseKind::ChangeBci
                     | PointwiseKind::ChangeHsb
+                    | PointwiseKind::ChangeOklab
                     | PointwiseKind::Combine
                     | PointwiseKind::Add
                     | PointwiseKind::Multiply

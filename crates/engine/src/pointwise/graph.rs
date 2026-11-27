@@ -18,6 +18,8 @@ pub use guarantees::{PointwiseChannelGuarantees, PointwisePreparationHandler};
 mod final_render;
 #[path = "graph_mode.rs"]
 mod mode;
+#[path = "graph_progress.rs"]
+mod progress;
 #[path = "graph_scale.rs"]
 mod scale;
 pub(in crate::pointwise) use scale::reaches_scaled_reference;
@@ -26,7 +28,7 @@ mod timed;
 pub(in crate::pointwise) use final_render::ThumbnailReuse;
 pub(in crate::pointwise) use final_render::{
     FinalExportCacheTree, FinalImageReuse, LabSimplifications, PlaybackImageCache,
-    StillExportCachePolicy,
+    SequenceOutputCache, StillExportCachePolicy,
 };
 pub use final_render::{PointwiseFinalGraph, PointwiseThumbnailCache};
 pub use mode::{
@@ -382,6 +384,7 @@ impl<E> NodeCore<E> {
             | PointwiseKind::Sharpen
             | PointwiseKind::ChangeBci
             | PointwiseKind::ChangeHsb
+            | PointwiseKind::ChangeOklab
             | PointwiseKind::Pixelate
             | PointwiseKind::Rotate => &["Original"],
             PointwiseKind::WizardColor
@@ -1309,7 +1312,7 @@ impl<E> PointwiseNode<E> {
             ))
         };
         let mut effects = super::PointwiseRenderEffects::new(&mut capacity, preflight);
-        self.render_graph_in_effects(width, height, options, context, &mut effects, None)
+        self.render_graph_in_effects(width, height, options, context, &mut effects, None, None)
     }
     /// Same Original graph evaluator with both real memory effects supplied.
     #[allow(clippy::too_many_arguments)]
@@ -1332,8 +1335,33 @@ impl<E> PointwiseNode<E> {
             Some((time, execution)),
             effects,
             None,
+            None,
         )
     }
+    pub(in crate::pointwise) fn render_original_sequence_frame(
+        &self,
+        geometry: ImageGeometry,
+        time: f64,
+        execution: crate::ProceduralExecution,
+        options: PointwiseRenderOptions,
+        cache: &mut SequenceOutputCache,
+        effects: &mut super::PointwiseRenderEffects<'_, E>,
+    ) -> Result<PointwiseRenderOutcome<E>, PointwiseError<E>>
+    where
+        E: 'static,
+    {
+        self.render_graph_in_effects(
+            geometry.width(),
+            geometry.height(),
+            options,
+            Some((time, execution)),
+            effects,
+            None,
+            Some(&mut final_render::OriginalSequenceFrame::new(cache)),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn render_graph_in_effects(
         &self,
         width: i32,
@@ -1342,6 +1370,7 @@ impl<E> PointwiseNode<E> {
         context: Option<(f64, crate::ProceduralExecution)>,
         effects: &mut super::PointwiseRenderEffects<'_, E>,
         mut final_render: Option<&mut final_render::FinalGraphExecution<'_, E>>,
+        mut original_sequence: Option<&mut final_render::OriginalSequenceFrame<'_>>,
     ) -> Result<PointwiseRenderOutcome<E>, PointwiseError<E>>
     where
         E: 'static,
@@ -1420,6 +1449,47 @@ impl<E> PointwiseNode<E> {
             PrepareUvTexture(PointwiseNode<E>, bool),
             FinishUvTexture(PointwiseNode<E>, bool),
         }
+        impl<E: 'static> Frame<E> {
+            fn node(&self) -> Option<&PointwiseNode<E>> {
+                match self {
+                    Self::Enter(node)
+                    | Self::Leave(node, _)
+                    | Self::LeaveReference(node)
+                    | Self::LeaveGroup(node, _, _)
+                    | Self::PrepareGroup(node, _, _, _)
+                    | Self::EnterFinalGroup(node, _)
+                    | Self::PrepareFinalGroupContents(node, _, _)
+                    | Self::EnterFinalScene(node)
+                    | Self::LeaveFinalScene(node, _)
+                    | Self::ForwardFinalScene(node)
+                    | Self::PrepareFinalSceneFromImage(node)
+                    | Self::FinishFinalSceneImage(node)
+                    | Self::PrepareUvTexture(node, _)
+                    | Self::FinishUvTexture(node, _) => Some(node),
+                    Self::LeaveEmpty(..) | Self::LeaveDisconnected | Self::EmptyFinalScene => None,
+                }
+            }
+
+            fn weight(&self, progress: &progress::GraphProgress) -> u64 {
+                let Some(node) = self.node() else {
+                    return 1;
+                };
+                match self {
+                    Self::Enter(_)
+                    | Self::EnterFinalGroup(..)
+                    | Self::EnterFinalScene(_)
+                    | Self::PrepareUvTexture(..) => progress.branch(node),
+                    Self::PrepareGroup(..) | Self::PrepareFinalGroupContents(..) => node
+                        .content(0)
+                        .ok()
+                        .and_then(|slot| slot.node())
+                        .map_or(1, |content| progress.branch(&content)),
+                    _ => progress::GraphProgress::kernel(node),
+                }
+            }
+        }
+        let observer = effects.graph_progress();
+        let mut progress = observer.map(|_| progress::GraphProgress::new(self));
         let mut stack = vec![Frame::Enter(self.clone())];
         let mut images: Vec<Option<SharedImageMap>> = Vec::new();
         let mut scenes: Vec<Option<crate::Scene>> = Vec::new();
@@ -1430,13 +1500,33 @@ impl<E> PointwiseNode<E> {
         let mut caught = Vec::new();
         let geometry = ImageGeometry::new(width, height);
         let time = context.map_or(0., |(time, _)| time);
-        while let Some(frame) = stack.pop() {
+        loop {
+            if let Some(progress) = &mut progress {
+                progress.resolve(&stack, |progress, frame| frame.weight(progress));
+            }
+            let Some(frame) = stack.pop() else {
+                break;
+            };
             super::check_render_cancelled(effects.cancel_check())?;
+            if let Some(progress) = &mut progress {
+                let fraction = progress.start(stack.len());
+                if let Some(observer) = observer
+                    && let Some(node) = frame.node()
+                {
+                    observer(fraction, &String::from_utf16_lossy(&node.identity_name()));
+                }
+            }
             match frame {
                 Frame::Enter(node) => {
                     // Covers topology changes since the initial read. As with
                     // other graph preparation, concurrent topology edits are
                     // not an atomic transaction and their ordering is unproved.
+                    if let Some(state) = &mut original_sequence
+                        && let Some(image) = state.image(node.id, geometry)
+                    {
+                        images.push(Some(image));
+                        continue;
+                    }
                     if let Some(final_render) = final_render.as_deref_mut() {
                         if let Some(image) = final_render.lookup(&node, geometry) {
                             images.push(Some(image));
@@ -1794,6 +1884,10 @@ impl<E> PointwiseNode<E> {
                     image.finish_graph_render()?;
                     if let Some(final_render) = final_render.as_deref_mut() {
                         final_render.record(&node, &image);
+                    } else if caught.is_empty()
+                        && let Some(state) = &mut original_sequence
+                    {
+                        state.record(&node, &image);
                     }
                     images.push(Some(image));
                     active.remove(&node.id);
@@ -1836,6 +1930,10 @@ impl<E> PointwiseNode<E> {
                     image.finish_graph_render()?;
                     if let Some(final_render) = final_render.as_deref_mut() {
                         final_render.record(&node, &image);
+                    } else if caught.is_empty()
+                        && let Some(state) = &mut original_sequence
+                    {
+                        state.record(&node, &image);
                     }
                     images.push(Some(image));
                     active.remove(&node.id);
@@ -1876,6 +1974,11 @@ impl<E> PointwiseNode<E> {
                         && let Some(image) = &image
                     {
                         final_render.record(&node, image);
+                    } else if caught.is_empty()
+                        && let Some(state) = &mut original_sequence
+                        && let Some(image) = &image
+                    {
+                        state.record(&node, image);
                     }
                     images.push(image);
                     active.remove(&node.id);

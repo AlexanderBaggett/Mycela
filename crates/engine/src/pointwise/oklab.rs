@@ -1,4 +1,4 @@
-//! Mycela's Oklab color source. Connected red channels replace scalar controls.
+//! Oklab color generation and adjustments of encoded RGB.
 use super::{PointwiseError, PointwiseFilter, SharedImageMap, check_render_cancelled};
 use crate::{FloatBuffer, ImageError, ImageGeometry};
 
@@ -61,6 +61,105 @@ fn srgb(lightness: f64, a: f64, b: f64) -> [f32; 3] {
             (1.055 * linear.powf(1.0 / 2.4) - 0.055) as f32
         }
     })
+}
+
+fn oklab([r, g, b]: [f32; 3]) -> [f64; 3] {
+    let [r, g, b] = [r, g, b].map(|encoded| {
+        let encoded = f64::from(encoded);
+        if encoded <= 0.04045 {
+            encoded / 12.92
+        } else {
+            ((encoded + 0.055) / 1.055).powf(2.4)
+        }
+    });
+    // Ottosson's linear sRGB-to-Oklab transform, matching the inverse above.
+    let l = (0.4122214708 * r + 0.5363325363 * g + 0.0514459929 * b).cbrt();
+    let m = (0.2119034982 * r + 0.6806995451 * g + 0.1073969566 * b).cbrt();
+    let s = (0.0883024619 * r + 0.2817188376 * g + 0.6299787005 * b).cbrt();
+    [
+        0.2104542553 * l + 0.7936177850 * m - 0.0040720468 * s,
+        1.9779984951 * l - 2.4285922050 * m + 0.4505937099 * s,
+        0.0259040371 * l + 0.7827717662 * m - 0.8086757660 * s,
+    ]
+}
+
+pub(super) fn adjust<E: 'static>(
+    filter: &PointwiseFilter<E>,
+    input: Option<SharedImageMap>,
+    geometry: ImageGeometry,
+    time: Option<f64>,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<SharedImageMap, PointwiseError<E>> {
+    check_render_cancelled(cancelled)?;
+    let input = input.ok_or(PointwiseError::NullReference)?;
+    let amount = |index| {
+        let property = filter.parameter(index)?;
+        match time {
+            Some(time) => property.effective_value_at(time),
+            None => Ok(property.number()),
+        }
+    };
+    let [lightness, green_red, blue_yellow] = [amount(0)?, amount(1)?, amount(2)?];
+    if [lightness, green_red, blue_yellow] == [0.; 3] {
+        return Ok(input);
+    }
+    if geometry.width() <= 0 || geometry.height() <= 0 {
+        return Err(ImageError::Argument.into());
+    }
+    let pixel_count = geometry
+        .width()
+        .checked_mul(geometry.height())
+        .ok_or(ImageError::Overflow)? as usize;
+    let rgb = [
+        input.channel(0, true)?.shared_values(),
+        input.channel(1, true)?.shared_values(),
+        input.channel(2, true)?.shared_values(),
+    ];
+    if rgb
+        .iter()
+        .any(|plane| plane.len() != 1 && plane.len() != pixel_count)
+    {
+        return Err(ImageError::Argument.into());
+    }
+    let color = |index| {
+        let [l, a, b] = oklab(std::array::from_fn(|channel| {
+            let plane = &rgb[channel];
+            plane[if plane.len() == 1 { 0 } else { index }]
+        }));
+        srgb(
+            (l + lightness).clamp(0., 1.),
+            a + green_red,
+            b + blue_yellow,
+        )
+    };
+    let output = SharedImageMap::new(geometry);
+    output.set_buffer(3, Some(&input.channel(3, true)?))?;
+    output.copy_auxiliary(&input)?;
+    if rgb.iter().all(|plane| plane.len() == 1) {
+        for (channel, value) in color(0).into_iter().enumerate() {
+            output.set_constant(channel as i32, value)?;
+        }
+    } else {
+        let planes = [
+            output.materialize(0)?,
+            output.materialize(1)?,
+            output.materialize(2)?,
+        ];
+        let mut samples = [[0.; BLOCK]; 3];
+        for start in (0..pixel_count).step_by(BLOCK) {
+            check_render_cancelled(cancelled)?;
+            let count = (pixel_count - start).min(BLOCK);
+            for offset in 0..count {
+                for (block, value) in samples.iter_mut().zip(color(start + offset)) {
+                    block[offset] = value;
+                }
+            }
+            for (plane, block) in planes.iter().zip(&samples) {
+                plane.write_block(start, 1, &block[..count])?;
+            }
+        }
+    }
+    Ok(output)
 }
 
 pub(super) fn render<E: 'static>(

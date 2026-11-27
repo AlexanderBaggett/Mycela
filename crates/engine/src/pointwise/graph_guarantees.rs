@@ -374,6 +374,13 @@ impl<E: 'static> PointwiseNode<E> {
                 change_bci_guarantees(&filter, input, &mut result)?;
             }
             Payload::Filter {
+                kind: PointwiseKind::ChangeOklab,
+                ..
+            } => {
+                result.constants[3] = input.constants[3];
+                result.in_range[3] = input.effective_range(3);
+            }
+            Payload::Filter {
                 kind: PointwiseKind::ChangeHsb,
                 ..
             } => {

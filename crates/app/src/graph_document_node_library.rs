@@ -85,6 +85,7 @@ const IMAGE_FAMILIES: &[Family] = &[
         nodes: &[
             "Change BCI",
             "Change HSB",
+            "Change Oklab",
             "Colorize",
             "Equalize",
             "Invert",

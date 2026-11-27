@@ -37,11 +37,14 @@ pub(crate) struct ImageCapture {
 }
 impl ImageCapture {
     pub(crate) fn share_image(old: RawImage) -> ImageMap {
+        Self::sharing().image(old)
+    }
+
+    pub(crate) fn sharing() -> Self {
         Self {
             share_backing: true,
             ..Self::default()
         }
-        .image(old)
     }
 
     pub(crate) fn buffer(&mut self, old: &FloatBuffer) -> FloatBuffer {
